@@ -1,6 +1,7 @@
 package app;
 
 import javafx.application.Application;
+import javafx.application.Platform;
 import javafx.concurrent.Worker;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -25,6 +26,8 @@ import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MakeCodeBlankApp extends Application {
 
@@ -36,6 +39,7 @@ public class MakeCodeBlankApp extends Application {
             1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0 };
     static final double ZOOM_MIN = 0.25;
     static final double ZOOM_MAX = 4.0;
+    static final Pattern ERROR_POS = Pattern.compile("\\((\\d+)\\s*,\\s*(\\d+)\\)|:(\\d+):(\\d+)|(?:line|行)\\s*(\\d+)");
 
     static final String SAMPLE = """
             player.onChat("run", function () {
@@ -52,7 +56,11 @@ public class MakeCodeBlankApp extends Application {
     private final Label zoomLabel = new Label("100%");
     private WebEngine engine;
     private WebView view;
+    private WebEngine editorEngine;
+    private WebView editorView;
     private TextArea codeArea;
+    private SplitPane split;
+    private boolean editorReady;
     private Stage stage;
     private File pendingPdf;
     private double zoom = 1.0;
@@ -62,7 +70,20 @@ public class MakeCodeBlankApp extends Application {
         this.stage = stage;
 
         codeArea = new TextArea(SAMPLE);
-        codeArea.setStyle("-fx-font-family: 'monospace'; -fx-font-size: 13px;");
+        codeArea.setStyle("-fx-font-family: 'Consolas', monospace; -fx-font-size: 13px;");
+
+        editorView = new WebView();
+        editorEngine = editorView.getEngine();
+        editorEngine.getLoadWorker().stateProperty().addListener((obs, oldS, s) -> {
+            if (s == Worker.State.SUCCEEDED) {
+                JSObject win = (JSObject) editorEngine.executeScript("window");
+                win.setMember("bridge", bridge);
+                editorEngine.executeScript("notifyEditorIfReady()");
+            } else if (s == Worker.State.FAILED) {
+                useFallbackEditor("エディタのページを読み込めませんでした");
+            }
+        });
+        editorEngine.load(getClass().getResource("/editor.html").toExternalForm());
 
         view = new WebView();
         engine = view.getEngine();
@@ -139,7 +160,7 @@ public class MakeCodeBlankApp extends Application {
             e.consume();
         });
 
-        SplitPane split = new SplitPane(codeArea, view);
+        split = new SplitPane(editorView, view);
         split.setDividerPositions(0.35);
 
         BorderPane root = new BorderPane(split);
@@ -220,11 +241,68 @@ public class MakeCodeBlankApp extends Application {
 
     private void renderCode() {
         try {
+            editorJs("clearErrorMarkers()");
             JSObject win = (JSObject) engine.executeScript("window");
-            win.setMember("pendingCode", codeArea.getText());
+            win.setMember("pendingCode", codeText());
             engine.executeScript("renderCode(pendingCode)");
         } catch (Exception ex) {
             status.setText("エラー: " + ex.getMessage());
+        }
+    }
+
+    private String codeText() {
+        if (editorReady) {
+            try {
+                Object v = editorEngine.executeScript("getCode()");
+                if (v instanceof String) return (String) v;
+            } catch (Exception ignored) {
+            }
+        }
+        return codeArea.getText();
+    }
+
+    private void setEditorCode(String code) {
+        try {
+            JSObject win = (JSObject) editorEngine.executeScript("window");
+            win.setMember("pendingCode", code);
+            editorEngine.executeScript("setCode(pendingCode)");
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void editorJs(String script) {
+        if (!editorReady) return;
+        try {
+            editorEngine.executeScript(script);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void useFallbackEditor(String reason) {
+        if (editorReady || split == null || split.getItems().get(0) == codeArea) return;
+        split.getItems().set(0, codeArea);
+        status.setText(reason + "。簡易入力欄に切り替えました");
+    }
+
+    private void markCodeError(String raw) {
+        if (!editorReady || raw == null) return;
+        Matcher m = ERROR_POS.matcher(raw);
+        if (!m.find()) return;
+        int line = 1, column = 1;
+        if (m.group(1) != null) {
+            line = Integer.parseInt(m.group(1));
+            column = Integer.parseInt(m.group(2));
+        } else if (m.group(3) != null) {
+            line = Integer.parseInt(m.group(3));
+            column = Integer.parseInt(m.group(4));
+        } else if (m.group(5) != null) {
+            line = Integer.parseInt(m.group(5));
+        }
+        try {
+            JSObject win = (JSObject) editorEngine.executeScript("window");
+            win.setMember("pendingError", raw);
+            editorEngine.executeScript("setErrorMarker(" + line + ", " + column + ", pendingError)");
+        } catch (Exception ignored) {
         }
     }
 
@@ -294,6 +372,25 @@ public class MakeCodeBlankApp extends Application {
         public void onError(String s) {
             status.setText("エラー: " + s);
             pendingPdf = null;
+        }
+
+        public void onEditorReady(String info) {
+            if (editorReady) return;
+            editorReady = true;
+            System.out.println("[editor] " + info);
+            Platform.runLater(() -> setEditorCode(SAMPLE));
+        }
+
+        public void onEditorInfo(String info) {
+            System.out.println("[editor] " + info);
+        }
+
+        public void onEditorFailed(String s) {
+            useFallbackEditor("エディタを読み込めませんでした（" + s + "）");
+        }
+
+        public void onCodeError(String raw) {
+            Platform.runLater(() -> markCodeError(raw));
         }
 
         public void onExport(String q, String a) {

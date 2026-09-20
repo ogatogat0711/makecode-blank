@@ -54,6 +54,7 @@ function onRendered(msg) {
   if (!msg.svg) {
     out.innerHTML = "";
     toJava("onError", "ブロックへの変換に失敗しました" + (msg.error ? "：" + msg.error : ""));
+    toJava("onCodeError", String(msg.error || ""));
     return;
   }
   out.innerHTML = msg.svg;
