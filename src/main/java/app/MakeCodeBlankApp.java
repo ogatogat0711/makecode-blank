@@ -3,8 +3,12 @@ package app;
 import javafx.application.Application;
 import javafx.concurrent.Worker;
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
+import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.web.WebEngine;
@@ -28,6 +32,10 @@ public class MakeCodeBlankApp extends Application {
     static final int SCALE = 4;
     /** PDFの余白（pt） */
     static final float MARGIN = 40f;
+    static final double[] ZOOM_STEPS = { 0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0,
+            1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0 };
+    static final double ZOOM_MIN = 0.25;
+    static final double ZOOM_MAX = 4.0;
 
     static final String SAMPLE = """
             player.onChat("run", function () {
@@ -41,10 +49,13 @@ public class MakeCodeBlankApp extends Application {
     // JSから呼ばれるオブジェクト。GCで消えないようフィールドで保持する
     private final Bridge bridge = new Bridge();
     private final Label status = new Label("MakeCode レンダラーを読み込み中…");
+    private final Label zoomLabel = new Label("100%");
     private WebEngine engine;
+    private WebView view;
     private TextArea codeArea;
     private Stage stage;
     private File pendingPdf;
+    private double zoom = 1.0;
 
     @Override
     public void start(Stage stage) {
@@ -53,7 +64,7 @@ public class MakeCodeBlankApp extends Application {
         codeArea = new TextArea(SAMPLE);
         codeArea.setStyle("-fx-font-family: 'monospace'; -fx-font-size: 13px;");
 
-        WebView view = new WebView();
+        view = new WebView();
         engine = view.getEngine();
         engine.getLoadWorker().stateProperty().addListener((obs, oldS, s) -> {
             if (s == Worker.State.SUCCEEDED) {
@@ -100,8 +111,33 @@ public class MakeCodeBlankApp extends Application {
         Button svgBtn = new Button("SVG保存");
         svgBtn.setOnAction(e -> js("dumpSvg()"));
 
-        ToolBar bar = new ToolBar(renderBtn, new Separator(), targetBtn, blankBtn, clearBtn, new Separator(), pdfBtn, new Separator(), svgBtn);
-        ToolBar kindBar = new ToolBar(new Label("空欄対象: "), repeatChk, numberChk, dirChk, varChk, textChk, otherChk);
+        Button vertBtn = new Button("縦に並べる");
+        vertBtn.setOnAction(e -> js("arrangeVertical()"));
+        Button horizBtn = new Button("横に並べる");
+        horizBtn.setOnAction(e -> js("arrangeHorizontal()"));
+        Button resetPosBtn = new Button("位置をリセット");
+        resetPosBtn.setOnAction(e -> js("resetLayout()"));
+
+        Button zoomOutBtn = new Button("－");
+        zoomOutBtn.setOnAction(e -> stepZoom(-1));
+        Button zoomInBtn = new Button("＋");
+        zoomInBtn.setOnAction(e -> stepZoom(1));
+        Button fitBtn = new Button("ウィンドウに合わせる");
+        fitBtn.setOnAction(e -> fitZoom());
+        zoomLabel.setMinWidth(48);
+        zoomLabel.setAlignment(Pos.CENTER);
+
+        ToolBar bar = new ToolBar(renderBtn, new Separator(), targetBtn, blankBtn, clearBtn,
+                new Separator(), new Label("配置: "), vertBtn, horizBtn, resetPosBtn,
+                new Separator(), pdfBtn, new Separator(), svgBtn);
+        ToolBar kindBar = new ToolBar(new Label("空欄対象: "), repeatChk, numberChk, dirChk, varChk, textChk, otherChk,
+                new Separator(), new Label("表示倍率: "), zoomOutBtn, zoomLabel, zoomInBtn, fitBtn);
+
+        view.addEventFilter(ScrollEvent.SCROLL, e -> {
+            if (!e.isControlDown() || e.getDeltaY() == 0) return;
+            applyZoom(e.getDeltaY() > 0 ? zoom * 1.1 : zoom / 1.1);
+            e.consume();
+        });
 
         SplitPane split = new SplitPane(codeArea, view);
         split.setDividerPositions(0.35);
@@ -111,9 +147,68 @@ public class MakeCodeBlankApp extends Application {
         BorderPane.setMargin(status, new Insets(4, 8, 4, 8));
         root.setBottom(status);
 
+        Scene scene = new Scene(root, 1200, 750);
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
+            if (!e.isControlDown()) return;
+            KeyCode c = e.getCode();
+            if (c == KeyCode.PLUS || c == KeyCode.ADD || c == KeyCode.EQUALS) {
+                stepZoom(1);
+                e.consume();
+            } else if (c == KeyCode.MINUS || c == KeyCode.SUBTRACT) {
+                stepZoom(-1);
+                e.consume();
+            }
+        });
+
         stage.setTitle("MakeCode 穴埋めブロック作成");
-        stage.setScene(new Scene(root, 1200, 750));
+        stage.setScene(scene);
         stage.show();
+    }
+
+    private void applyZoom(double z) {
+        zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z));
+        view.setZoom(zoom);
+        zoomLabel.setText(Math.round(zoom * 100) + "%");
+    }
+
+    private void stepZoom(int dir) {
+        double eps = 1e-6;
+        if (dir > 0) {
+            for (double s : ZOOM_STEPS) {
+                if (s > zoom + eps) { applyZoom(s); return; }
+            }
+            applyZoom(ZOOM_MAX);
+        } else {
+            for (int i = ZOOM_STEPS.length - 1; i >= 0; i--) {
+                if (ZOOM_STEPS[i] < zoom - eps) { applyZoom(ZOOM_STEPS[i]); return; }
+            }
+            applyZoom(ZOOM_MIN);
+        }
+    }
+
+    private void fitZoom() {
+        double w = svgSize("width");
+        double h = svgSize("height");
+        if (w <= 0 || h <= 0) {
+            status.setText("先にブロック変換をしてください");
+            return;
+        }
+        double pad = 48;
+        double fit = Math.min((view.getWidth() - pad) / w, (view.getHeight() - pad) / h);
+        applyZoom(fit);
+    }
+
+    private double svgSize(String attr) {
+        try {
+            Object v = engine.executeScript(
+                    "(function(){var s=document.querySelector('#out svg');"
+                    + "if(!s) return 0;"
+                    + "return parseFloat(s.getAttribute('" + attr + "'))"
+                    + "||s.getBoundingClientRect()." + attr + ";})()");
+            return v instanceof Number ? ((Number) v).doubleValue() : 0;
+        } catch (Exception ex) {
+            return 0;
+        }
     }
 
     private static CheckBox kindBox(String label, String kind, boolean selected){

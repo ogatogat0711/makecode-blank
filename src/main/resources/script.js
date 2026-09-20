@@ -60,7 +60,8 @@ function onRendered(msg) {
   const svg = out.querySelector("svg");
   if (!svg) { toJava("onError", "SVGが見つかりません"); return; }
   prepareFields(svg);
-  status("変換完了：空欄候補 " + fieldStats.all + " 個。プレビューの引数をクリックすると個別に空欄を切り替えられます。");
+  prepareLayout(svg);
+  status("変換完了：空欄候補 " + fieldStats.all + " 個。引数のクリックで空欄を切り替え、ブロックの地の部分をドラッグすると位置を動かせます。");
 }
 
 const DIRECTION_WORDS = ["前", "後ろ", "左", "右", "上", "下"];
@@ -169,6 +170,7 @@ function prepareFields(svg) {
     r.style.setProperty("pointer-events", "all", "important");
     setShown(r, false);
     host.appendChild(r);
+    host.setAttribute("data-fieldhost", "1");
 
     const toggle = e => {
       e.stopPropagation();
@@ -192,6 +194,187 @@ function blankKinds(csv) {
 function blankAll()    { blanks().forEach(r => setShown(r, true)); }
 function clearBlanks() { blanks().forEach(r => setShown(r, false)); }
 
+const LAYOUT_GAP = 24;
+const ROW_TOLERANCE = 20;
+
+let canvasEl = null;
+let stacks = [];
+let home = null;
+let drag = null;
+
+function getTranslate(el){
+  const m = /translate\(\s*([-\d.]+)[\s,]+([-\d.]+)/.exec(el.getAttribute("transform") || "");
+  return m ? { x: parseFloat(m[1]), y: parseFloat(m[2]) } : { x: 0, y: 0 };
+}
+
+function setTranslate(el, x, y){
+  const rest = (el.getAttribute("transform") || "").replace(/translate\([^)]*\)/, "").trim();
+  el.setAttribute("transform", "translate(" + x + ", " + y + ")" + (rest ? " " + rest : ""));
+}
+
+function prepareLayout(svg){
+  canvasEl = svg.querySelector("g.blocklyBlockCanvas");
+  stacks = canvasEl ? Array.from(canvasEl.children).filter(el => hasClass(el, "blocklyBlock")) : [];
+  home = {
+    width: svg.getAttribute("width"),
+    height: svg.getAttribute("height"),
+    viewBox: svg.getAttribute("viewBox"),
+    canvas: canvasEl ? canvasEl.getAttribute("transform") : null,
+    items: stacks.map(el => ({ el: el, transform: el.getAttribute("transform") }))
+  };
+  stacks.forEach(el => el.style.cursor = "grab");
+  svg.addEventListener("mousedown", onDragStart);
+}
+
+function topStack(el){
+  let p = el;
+  while (p && p !== canvasEl){
+    if (p.parentElement === canvasEl && hasClass(p, "blocklyBlock")) return p;
+    p = p.parentElement;
+  }
+  return null;
+}
+
+function inFieldHost(el){
+  let p = el;
+  while (p && p !== canvasEl){
+    if (p.getAttribute && p.getAttribute("data-fieldhost") === "1") return true;
+    p = p.parentElement;
+  }
+  return false;
+}
+
+function toCanvasPoint(e){
+  const svg = document.querySelector("#out svg");
+  if (!svg || !canvasEl || !canvasEl.getScreenCTM) return null;
+  const m = canvasEl.getScreenCTM();
+  if (!m) return null;
+  const pt = svg.createSVGPoint();
+  pt.x = e.clientX;
+  pt.y = e.clientY;
+  return pt.matrixTransform(m.inverse());
+}
+
+function onDragStart(e){
+  if (e.button !== 0 || !canvasEl) return;
+  const stack = topStack(e.target);
+  if (!stack || inFieldHost(e.target)) return;
+  const p = toCanvasPoint(e);
+  if (!p) return;
+  const t = getTranslate(stack);
+  drag = { el: stack, dx: t.x - p.x, dy: t.y - p.y };
+  canvasEl.appendChild(stack);
+  stack.style.cursor = "grabbing";
+  e.preventDefault();
+  document.addEventListener("mousemove", onDragMove);
+  document.addEventListener("mouseup", onDragEnd);
+}
+
+function onDragMove(e){
+  if (!drag) return;
+  const p = toCanvasPoint(e);
+  if (!p) return;
+  const c = getTranslate(canvasEl);
+  const bb = safeBBox(drag.el);
+  let x = p.x + drag.dx;
+  let y = p.y + drag.dy;
+  if (bb){
+    x = Math.max(x, -c.x - bb.x);
+    y = Math.max(y, -c.y - bb.y);
+  }
+  setTranslate(drag.el, x, y);
+  growToFit();
+}
+
+function onDragEnd(){
+  document.removeEventListener("mousemove", onDragMove);
+  document.removeEventListener("mouseup", onDragEnd);
+  if (!drag) return;
+  drag.el.style.cursor = "grab";
+  drag = null;
+  normalizeLayout();
+}
+
+function contentBounds(){
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  stacks.forEach(el => {
+    const bb = safeBBox(el);
+    if (!bb) return;
+    const t = getTranslate(el);
+    minX = Math.min(minX, t.x + bb.x);
+    minY = Math.min(minY, t.y + bb.y);
+    maxX = Math.max(maxX, t.x + bb.x + bb.width);
+    maxY = Math.max(maxY, t.y + bb.y + bb.height);
+  });
+  return minX === Infinity ? null : { minX, minY, maxX, maxY };
+}
+
+function applySize(svg, w, h){
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
+  svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+}
+
+function growToFit(){
+  const svg = document.querySelector("#out svg");
+  const b = contentBounds();
+  if (!svg || !b) return;
+  const c = getTranslate(canvasEl);
+  const w = Math.max(parseFloat(svg.getAttribute("width")) || 0, Math.ceil(b.maxX + c.x));
+  const h = Math.max(parseFloat(svg.getAttribute("height")) || 0, Math.ceil(b.maxY + c.y));
+  applySize(svg, w, h);
+}
+
+function normalizeLayout(){
+  const svg = document.querySelector("#out svg");
+  const b = contentBounds();
+  if (!svg || !b) return;
+  setTranslate(canvasEl, -b.minX, -b.minY);
+  applySize(svg, Math.ceil(b.maxX - b.minX), Math.ceil(b.maxY - b.minY));
+}
+
+function arrangeStacks(vertical){
+  if (!canvasEl || !stacks.length){
+    toJava("onError", "先にブロック変換をしてください");
+    return;
+  }
+  const items = stacks.map(el => ({ el: el, t: getTranslate(el), bb: safeBBox(el) })).filter(o => o.bb);
+  items.sort((a, b) => {
+    const ay = a.t.y + a.bb.y, by = b.t.y + b.bb.y;
+    if (Math.abs(ay - by) > ROW_TOLERANCE) return ay - by;
+    return (a.t.x + a.bb.x) - (b.t.x + b.bb.x);
+  });
+  let cur = 0;
+  items.forEach(o => {
+    if (vertical){
+      setTranslate(o.el, -o.bb.x, cur - o.bb.y);
+      cur += o.bb.height + LAYOUT_GAP;
+    } else {
+      setTranslate(o.el, cur - o.bb.x, -o.bb.y);
+      cur += o.bb.width + LAYOUT_GAP;
+    }
+  });
+  normalizeLayout();
+  status((vertical ? "縦" : "横") + "に並べました（" + items.length + " 個のブロック列）");
+}
+
+function arrangeVertical()   { arrangeStacks(true); }
+function arrangeHorizontal() { arrangeStacks(false); }
+
+function resetLayout(){
+  const svg = document.querySelector("#out svg");
+  if (!svg || !home){
+    toJava("onError", "先にブロック変換をしてください");
+    return;
+  }
+  home.items.forEach(it => it.el.setAttribute("transform", it.transform));
+  if (canvasEl && home.canvas) canvasEl.setAttribute("transform", home.canvas);
+  svg.setAttribute("width", home.width);
+  svg.setAttribute("height", home.height);
+  if (home.viewBox) svg.setAttribute("viewBox", home.viewBox);
+  status("ブロックの位置を元に戻しました");
+}
+
 function dumpSvg(){
   const svg = document.querySelector("#out svg");
   if (!svg){
@@ -201,11 +384,19 @@ function dumpSvg(){
   toJava("onSvg", new XMLSerializer().serializeToString(svg));
 }
 
+function svgSize(svg){
+  const w = parseFloat(svg.getAttribute("width"));
+  const h = parseFloat(svg.getAttribute("height"));
+  if (w > 0 && h > 0) return { w: Math.ceil(w), h: Math.ceil(h) };
+  const r = svg.getBoundingClientRect();
+  return { w: Math.ceil(r.width), h: Math.ceil(r.height) };
+}
+
 function exportImages(scale) {
   const svg = document.querySelector("#out svg");
   if (!svg) { toJava("onError", "先にブロック変換をしてください"); return; }
-  const rect = svg.getBoundingClientRect();
-  const w = Math.ceil(rect.width), h = Math.ceil(rect.height);
+  const size = svgSize(svg);
+  const w = size.w, h = size.h;
 
   const rs = blanks();
   const saved = rs.map(r => r.getAttribute("data-on") === "1");
