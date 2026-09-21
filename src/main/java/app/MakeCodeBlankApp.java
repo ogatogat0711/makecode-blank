@@ -10,7 +10,10 @@ import javafx.scene.control.*;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.input.ScrollEvent;
+import javafx.scene.Parent;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 import javafx.scene.web.WebEngine;
 import javafx.scene.web.WebView;
@@ -40,6 +43,7 @@ public class MakeCodeBlankApp extends Application {
     static final double ZOOM_MIN = 0.25;
     static final double ZOOM_MAX = 4.0;
     static final Pattern ERROR_POS = Pattern.compile("\\((\\d+)\\s*,\\s*(\\d+)\\)|:(\\d+):(\\d+)|(?:line|行)\\s*(\\d+)");
+    static final String TITLE = "MakeCode 穴埋めブロック作成";
 
     static final String SAMPLE = """
             player.onChat("run", function () {
@@ -61,6 +65,10 @@ public class MakeCodeBlankApp extends Application {
     private TextArea codeArea;
     private SplitPane split;
     private boolean editorReady;
+    private Scene scene;
+    private Parent homeRoot;
+    private Parent editorRoot;
+    private Parent ocrRoot;
     private Stage stage;
     private File pendingPdf;
     private double zoom = 1.0;
@@ -69,6 +77,92 @@ public class MakeCodeBlankApp extends Application {
     public void start(Stage stage) {
         this.stage = stage;
 
+        editorRoot = buildEditorScreen();
+        homeRoot = buildHomeScreen();
+        ocrRoot = buildOcrScreen();
+
+        scene = new Scene(homeRoot, 1200, 750);
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
+            if (!e.isControlDown() || scene.getRoot() != editorRoot) return;
+            KeyCode c = e.getCode();
+            if (c == KeyCode.PLUS || c == KeyCode.ADD || c == KeyCode.EQUALS) {
+                stepZoom(1);
+                e.consume();
+            } else if (c == KeyCode.MINUS || c == KeyCode.SUBTRACT) {
+                stepZoom(-1);
+                e.consume();
+            }
+        });
+
+        stage.setScene(scene);
+        showHome();
+        stage.show();
+    }
+
+    private void showScreen(Parent root, String subtitle) {
+        scene.setRoot(root);
+        stage.setTitle(subtitle == null ? TITLE : TITLE + " － " + subtitle);
+    }
+
+    private void showHome()   { showScreen(homeRoot, null); }
+    private void showEditor() { showScreen(editorRoot, "JavaScript から作成"); }
+    private void showOcr()    { showScreen(ocrRoot, "画像認識から作成"); }
+
+    private Parent buildHomeScreen() {
+        Label title = new Label(TITLE);
+        title.setStyle("-fx-font-size: 22px; -fx-font-weight: bold;");
+        Label lead = new Label("MakeCode のプログラムをブロック図にして、穴埋め教材の PDF を作ります");
+        lead.setStyle("-fx-font-size: 13px; -fx-text-fill: #555;");
+
+        Button codeBtn = homeChoice("JavaScript コードから問題を作る",
+                "コードを貼り付けてブロック図に変換します");
+        codeBtn.setOnAction(e -> showEditor());
+        Button ocrBtn = homeChoice("画像認識から問題を作る",
+                "手書きの設計書の画像から作ります（画像認識は未実装）");
+        ocrBtn.setOnAction(e -> showOcr());
+
+        VBox box = new VBox(16, title, lead, new Separator(), codeBtn, ocrBtn);
+        box.setAlignment(Pos.CENTER);
+        box.setPadding(new Insets(40));
+        box.setMaxWidth(Region.USE_PREF_SIZE);
+
+        StackPane pane = new StackPane(box);
+        pane.setStyle("-fx-background-color: #fafafa;");
+        return pane;
+    }
+
+    private static Button homeChoice(String title, String detail) {
+        Label t = new Label(title);
+        t.setStyle("-fx-font-size: 15px; -fx-font-weight: bold;");
+        Label d = new Label(detail);
+        d.setStyle("-fx-font-size: 12px; -fx-text-fill: #666;");
+        VBox g = new VBox(4, t, d);
+        g.setAlignment(Pos.CENTER_LEFT);
+        Button b = new Button();
+        b.setGraphic(g);
+        b.setPrefSize(440, 74);
+        b.setAlignment(Pos.CENTER_LEFT);
+        return b;
+    }
+
+    private Parent buildOcrScreen() {
+        Button backBtn = new Button("← 最初の画面");
+        backBtn.setOnAction(e -> showHome());
+        ToolBar bar = new ToolBar(backBtn);
+
+        Label note = new Label("画像認識からの問題作成はまだ実装されていません");
+        note.setStyle("-fx-font-size: 15px;");
+        Label detail = new Label("手書きの設計書を読み取ってブロックにする機能がここに入ります（OCR.md 参照）");
+        detail.setStyle("-fx-font-size: 12px; -fx-text-fill: #666;");
+        VBox box = new VBox(8, note, detail);
+        box.setAlignment(Pos.CENTER);
+
+        BorderPane root = new BorderPane(box);
+        root.setTop(bar);
+        return root;
+    }
+
+    private Parent buildEditorScreen() {
         codeArea = new TextArea(SAMPLE);
         codeArea.setStyle("-fx-font-family: 'Consolas', monospace; -fx-font-size: 13px;");
 
@@ -148,7 +242,10 @@ public class MakeCodeBlankApp extends Application {
         zoomLabel.setMinWidth(48);
         zoomLabel.setAlignment(Pos.CENTER);
 
-        ToolBar bar = new ToolBar(renderBtn, new Separator(), targetBtn, blankBtn, clearBtn,
+        Button backBtn = new Button("← 最初の画面");
+        backBtn.setOnAction(e -> showHome());
+
+        ToolBar bar = new ToolBar(backBtn, new Separator(), renderBtn, new Separator(), targetBtn, blankBtn, clearBtn,
                 new Separator(), new Label("配置: "), vertBtn, horizBtn, resetPosBtn,
                 new Separator(), pdfBtn, new Separator(), svgBtn);
         ToolBar kindBar = new ToolBar(new Label("空欄対象: "), repeatChk, numberChk, dirChk, varChk, textChk, otherChk,
@@ -167,23 +264,7 @@ public class MakeCodeBlankApp extends Application {
         root.setTop(new VBox(bar, kindBar));
         BorderPane.setMargin(status, new Insets(4, 8, 4, 8));
         root.setBottom(status);
-
-        Scene scene = new Scene(root, 1200, 750);
-        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
-            if (!e.isControlDown()) return;
-            KeyCode c = e.getCode();
-            if (c == KeyCode.PLUS || c == KeyCode.ADD || c == KeyCode.EQUALS) {
-                stepZoom(1);
-                e.consume();
-            } else if (c == KeyCode.MINUS || c == KeyCode.SUBTRACT) {
-                stepZoom(-1);
-                e.consume();
-            }
-        });
-
-        stage.setTitle("MakeCode 穴埋めブロック作成");
-        stage.setScene(scene);
-        stage.show();
+        return root;
     }
 
     private void applyZoom(double z) {
