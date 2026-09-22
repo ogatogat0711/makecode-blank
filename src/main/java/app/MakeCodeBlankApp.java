@@ -11,7 +11,11 @@ import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.input.ScrollEvent;
 import javafx.scene.Parent;
+import javafx.scene.image.Image;
+import javafx.scene.image.ImageView;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
@@ -26,9 +30,14 @@ import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -43,14 +52,19 @@ public class MakeCodeBlankApp extends Application {
     static final double ZOOM_MIN = 0.25;
     static final double ZOOM_MAX = 4.0;
     static final Pattern ERROR_POS = Pattern.compile("\\((\\d+)\\s*,\\s*(\\d+)\\)|:(\\d+):(\\d+)|(?:line|行)\\s*(\\d+)");
-    static final String TITLE = "MakeCode 穴埋めブロック作成";
+    static final Pattern PLACE_CALL = Pattern.compile("(agent|blocks)\\s*\\.\\s*place\\s*\\(");
+    static final String TITLE = "MakeCode設計書メーカー";
+    static final String VIEWER_EXE = "viewer/target/release/makecode-viewer.exe";
 
     static final String SAMPLE = """
             player.onChat("run", function () {
                 for (let index = 0; index < 5; index++) {
-                    blocks.place(GOLD_BLOCK, pos(0, index, 0))
+                    agent.place(FORWARD)
+                    agent.move(RIGHT, 1)
                 }
-                player.say("完成！")
+
+                agent.move(FORWARD, 1)
+                agent.move(LEFT, 1)
             })
             """;
 
@@ -62,6 +76,11 @@ public class MakeCodeBlankApp extends Application {
     private WebView view;
     private WebEngine editorEngine;
     private WebView editorView;
+    private WebEngine simEngine;
+    private WebView simView;
+    private boolean simReady;
+    private Button previewBtn;
+    private Process previewProcess;
     private TextArea codeArea;
     private SplitPane split;
     private boolean editorReady;
@@ -72,6 +91,14 @@ public class MakeCodeBlankApp extends Application {
     private Stage stage;
     private File pendingPdf;
     private double zoom = 1.0;
+    private final HandwritingOcr ocr = new HandwritingOcr();
+    private BufferedImage ocrImage;
+    private ImageView ocrView;
+    private StackPane ocrBusy;
+    private Label ocrStatus;
+    private Button ocrOpenBtn;
+    private Button ocrRotateBtn;
+    private Button ocrRunBtn;
 
     @Override
     public void start(Stage stage) {
@@ -105,8 +132,8 @@ public class MakeCodeBlankApp extends Application {
     }
 
     private void showHome()   { showScreen(homeRoot, null); }
-    private void showEditor() { showScreen(editorRoot, "JavaScript から作成"); }
-    private void showOcr()    { showScreen(ocrRoot, "画像認識から作成"); }
+    private void showEditor() { showScreen(editorRoot, "コード調整・ワークシート化"); }
+    private void showOcr()    { showScreen(ocrRoot, "画像認識"); }
 
     private Parent buildHomeScreen() {
         Label title = new Label(TITLE);
@@ -114,11 +141,11 @@ public class MakeCodeBlankApp extends Application {
         Label lead = new Label("MakeCode のプログラムをブロック図にして、穴埋め教材の PDF を作ります");
         lead.setStyle("-fx-font-size: 13px; -fx-text-fill: #555;");
 
-        Button codeBtn = homeChoice("JavaScript コードから問題を作る",
-                "コードを貼り付けてブロック図に変換します");
+        Button codeBtn = homeChoice("JavaScriptコードから",
+                "コードを貼り付けor編集してブロック図に変換します");
         codeBtn.setOnAction(e -> showEditor());
-        Button ocrBtn = homeChoice("画像認識から問題を作る",
-                "手書きの設計書の画像から作ります（画像認識は未実装）");
+        Button ocrBtn = homeChoice("画像認識から",
+                "手書きの設計書の画像から作ります");
         ocrBtn.setOnAction(e -> showOcr());
 
         VBox box = new VBox(16, title, lead, new Separator(), codeBtn, ocrBtn);
@@ -146,24 +173,175 @@ public class MakeCodeBlankApp extends Application {
     }
 
     private Parent buildOcrScreen() {
-        Button backBtn = new Button("← 最初の画面");
+        Button backBtn = new Button("← 戻る");
         backBtn.setOnAction(e -> showHome());
-        ToolBar bar = new ToolBar(backBtn);
+        ocrOpenBtn = new Button("画像を開く…");
+        ocrOpenBtn.setOnAction(e -> openOcrImage());
+        ocrRotateBtn = new Button("右に90°回転");
+        ocrRotateBtn.setDisable(true);
+        ocrRotateBtn.setOnAction(e -> setOcrImage(HandwritingOcr.rotateRight(ocrImage)));
+        ocrRunBtn = new Button("認識する");
+        ocrRunBtn.setDisable(true);
+        ocrRunBtn.setStyle("-fx-font-weight: bold;");
+        ocrRunBtn.setOnAction(e -> runOcr());
+        Button inviteBtn = new Button("招待コード…");
+        inviteBtn.setOnAction(e -> askInviteCode());
+        Label server = new Label(HandwritingOcr.hasServer()
+                ? "認識サーバー設定済"
+                : "認識サーバー未設定");
+        server.setStyle("-fx-text-fill: #666;");
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        ToolBar bar = new ToolBar(backBtn, new Separator(), ocrOpenBtn, ocrRotateBtn,
+                new Separator(), ocrRunBtn, spacer, server, inviteBtn);
 
-        Label note = new Label("画像認識からの問題作成はまだ実装されていません");
-        note.setStyle("-fx-font-size: 15px;");
-        Label detail = new Label("手書きの設計書を読み取ってブロックにする機能がここに入ります（OCR.md 参照）");
-        detail.setStyle("-fx-font-size: 12px; -fx-text-fill: #666;");
-        VBox box = new VBox(8, note, detail);
-        box.setAlignment(Pos.CENTER);
+        Label hint = new Label("手書きの設計書の写真を開いてください");
+        hint.setStyle("-fx-font-size: 15px; -fx-text-fill: #666;");
+        ocrView = new ImageView();
+        ocrView.setPreserveRatio(true);
+        ocrView.setSmooth(true);
+        hint.visibleProperty().bind(ocrView.imageProperty().isNull());
 
-        BorderPane root = new BorderPane(box);
+        ProgressIndicator spin = new ProgressIndicator();
+        Label busyText = new Label("認識中…（数十秒かかることがあります）");
+        busyText.setStyle("-fx-font-size: 14px; -fx-text-fill: white;");
+        VBox busyBox = new VBox(12, spin, busyText);
+        busyBox.setAlignment(Pos.CENTER);
+        ocrBusy = new StackPane(busyBox);
+        ocrBusy.setStyle("-fx-background-color: rgba(0, 0, 0, 0.45);");
+        ocrBusy.setVisible(false);
+
+        StackPane center = new StackPane(hint, ocrView, ocrBusy);
+        center.setMinSize(0, 0);
+        center.setPadding(new Insets(12));
+        center.setStyle("-fx-background-color: #f4f4f4;");
+        ocrView.fitWidthProperty().bind(center.widthProperty().subtract(24));
+        ocrView.fitHeightProperty().bind(center.heightProperty().subtract(24));
+
+        ocrStatus = new Label(HandwritingOcr.hasServer() ? ""
+                : "認識サーバーの URL が設定されていません（HandwritingOcr.DEFAULT_SERVER_URL か環境変数 "
+                        + HandwritingOcr.SERVER_URL_ENV + "）");
+        BorderPane root = new BorderPane(center);
         root.setTop(bar);
+        BorderPane.setMargin(ocrStatus, new Insets(4, 8, 4, 8));
+        root.setBottom(ocrStatus);
         return root;
     }
 
+    private void openOcrImage() {
+        FileChooser fc = new FileChooser();
+        fc.setTitle("手書きの設計メモの画像");
+        fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("画像", "*.jpg", "*.jpeg", "*.png"));
+        File f = fc.showOpenDialog(stage);
+        if (f == null) return;
+        try {
+            setOcrImage(HandwritingOcr.load(f));
+            ocrStatus.setText(f.getName() + " を開きました。向きが正しければ「認識する」を押してください");
+        } catch (HandwritingOcr.OcrException ex) {
+            ocrStatus.setText(ex.getMessage());
+        }
+    }
+
+    private void setOcrImage(BufferedImage img) {
+        ocrImage = img;
+        try {
+            ocrView.setImage(new Image(new ByteArrayInputStream(HandwritingOcr.toJpeg(img, 2048))));
+        } catch (IOException ex) {
+            ocrStatus.setText("画像を表示できませんでした: " + ex.getMessage());
+        }
+        ocrRotateBtn.setDisable(false);
+        ocrRunBtn.setDisable(false);
+    }
+
+    private void setOcrBusy(boolean busy) {
+        ocrBusy.setVisible(busy);
+        ocrOpenBtn.setDisable(busy);
+        ocrRotateBtn.setDisable(busy || ocrImage == null);
+        ocrRunBtn.setDisable(busy || ocrImage == null);
+    }
+
+    private boolean askInviteCode() {
+        TextInputDialog dialog = new TextInputDialog(ocr.inviteCode());
+        dialog.initOwner(stage);
+        dialog.setTitle("招待コード");
+        dialog.setHeaderText("招待コードを入力してください");
+        dialog.setContentText("招待コード:");
+        String code = dialog.showAndWait().map(String::strip).orElse(null);
+        if (code == null) return false;
+        ocr.setInviteCode(code);
+        ocrStatus.setText(code.isEmpty() ? "招待コードを消去しました" : "招待コードを保存しました");
+        return !code.isEmpty();
+    }
+
+    private void runOcr() {
+        if (ocrImage == null) return;
+        if (ocr.inviteCode().isEmpty() && !askInviteCode()) return;
+        BufferedImage img = ocrImage;
+        setOcrBusy(true);
+        ocrStatus.setText("認識中です…");
+        Thread worker = new Thread(() -> {
+            try {
+                HandwritingOcr.Result result = ocr.recognize(img);
+                Platform.runLater(() -> onOcrDone(result));
+            } catch (HandwritingOcr.OcrException ex) {
+                Platform.runLater(() -> onOcrFailed(ex));
+            } catch (RuntimeException ex) {
+                Platform.runLater(() -> onOcrFailed(new HandwritingOcr.OcrException(String.valueOf(ex))));
+            }
+        }, "ocr");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void onOcrFailed(HandwritingOcr.OcrException ex) {
+        setOcrBusy(false);
+        if (ex.badInvite) {
+            ocr.setInviteCode("");
+            ocrStatus.setText(ex.getMessage() + "。「招待コード…」から入力し直してください");
+        } else {
+            ocrStatus.setText("認識できませんでした: " + ex.getMessage());
+        }
+    }
+
+    private void onOcrDone(HandwritingOcr.Result result) {
+        setOcrBusy(false);
+        String code = result.code() == null ? "" : result.code().strip();
+        if (code.isEmpty()) {
+            ocrStatus.setText("コードを読み取れませんでした");
+            return;
+        }
+        ocrStatus.setText("認識しました。エディタ画面に読み込みました");
+        loadCodeIntoEditor(code);
+        showEditor();
+        Platform.runLater(this::renderCode);
+
+        List<String> notes = result.notes() == null ? List.of()
+                : result.notes().stream().filter(s -> s != null && !s.isBlank()).toList();
+        if (!notes.isEmpty()) {
+            Alert alert = new Alert(Alert.AlertType.INFORMATION);
+            alert.initOwner(stage);
+            alert.setTitle("画像認識の結果");
+            alert.setHeaderText("読み取りに自信がない箇所があります。コードを確認してください");
+            alert.setContentText("・" + String.join("\n・", notes));
+            alert.show();
+        }
+    }
+
+    private void loadCodeIntoEditor(String code) {
+        codeArea.setText(code);
+        if (editorReady) setEditorCode(code);
+    }
+
     private Parent buildEditorScreen() {
+        simView = new WebView();
+        simEngine = simView.getEngine();
+        simEngine.getLoadWorker().stateProperty().addListener((obs, oldS, s) -> {
+            if (s == Worker.State.SUCCEEDED) simReady = true;
+        });
+        simEngine.load(getClass().getResource("/simulate.html").toExternalForm());
+
         codeArea = new TextArea(SAMPLE);
+        codeArea.textProperty().addListener((obs, oldV, v) -> updatePreviewButton(v));
         codeArea.setStyle("-fx-font-family: 'Consolas', monospace; -fx-font-size: 13px;");
 
         editorView = new WebView();
@@ -194,27 +372,11 @@ public class MakeCodeBlankApp extends Application {
 
         Button renderBtn = new Button("ブロックに変換");
         renderBtn.setOnAction(e -> renderCode());
-        CheckBox repeatChk = kindBox("繰り返し回数", "repeat", true);
-        CheckBox numberChk = kindBox("数値", "number", false);
-        CheckBox dirChk = kindBox("方向", "direction", true);
-        CheckBox varChk = kindBox("変数", "variable", true);
-        CheckBox textChk = kindBox("文字列", "text", false);
-        CheckBox otherChk = kindBox("その他", "other", false);
-        CheckBox[] kindChecks = { repeatChk, numberChk, dirChk, varChk, textChk, otherChk };
 
-        Button targetBtn = new Button("チェックした種類を空欄");
-        targetBtn.setOnAction(e -> {
-            StringBuilder sb = new StringBuilder();
-            for(CheckBox c : kindChecks){
-                if (c.isSelected()){
-                    if(sb.length() > 0)
-                        sb.append(',');
-                    sb.append(c.getUserData());
-                }
-            }
-            js("blankKinds('" + sb +"')");
-        });
-
+        previewBtn = new Button("3Dプレビュー");
+        previewBtn.setDisable(true);
+        previewBtn.setOnAction(e -> openPreview3D());
+    
 
         Button blankBtn = new Button("引数をすべて空欄");
         blankBtn.setOnAction(e -> js("blankAll()"));
@@ -245,11 +407,10 @@ public class MakeCodeBlankApp extends Application {
         Button backBtn = new Button("← 最初の画面");
         backBtn.setOnAction(e -> showHome());
 
-        ToolBar bar = new ToolBar(backBtn, new Separator(), renderBtn, new Separator(), targetBtn, blankBtn, clearBtn,
+        ToolBar bar = new ToolBar(backBtn, new Separator(), renderBtn, previewBtn, new Separator(), blankBtn, clearBtn,
                 new Separator(), new Label("配置: "), vertBtn, horizBtn, resetPosBtn,
                 new Separator(), pdfBtn, new Separator(), svgBtn);
-        ToolBar kindBar = new ToolBar(new Label("空欄対象: "), repeatChk, numberChk, dirChk, varChk, textChk, otherChk,
-                new Separator(), new Label("表示倍率: "), zoomOutBtn, zoomLabel, zoomInBtn, fitBtn);
+        ToolBar kindBar = new ToolBar(new Label("表示倍率: "), zoomOutBtn, zoomLabel, zoomInBtn, fitBtn);
 
         view.addEventFilter(ScrollEvent.SCROLL, e -> {
             if (!e.isControlDown() || e.getDeltaY() == 0) return;
@@ -313,13 +474,6 @@ public class MakeCodeBlankApp extends Application {
         }
     }
 
-    private static CheckBox kindBox(String label, String kind, boolean selected){
-        CheckBox c = new CheckBox(label);
-        c.setUserData(kind);
-        c.setSelected(selected);
-        return c;
-    }
-
     private void renderCode() {
         try {
             editorJs("clearErrorMarkers()");
@@ -357,6 +511,53 @@ public class MakeCodeBlankApp extends Application {
             editorEngine.executeScript(script);
         } catch (Exception ignored) {
         }
+    }
+
+    private void updatePreviewButton(String code) {
+        if (previewBtn == null) return;
+        previewBtn.setDisable(code == null || !PLACE_CALL.matcher(code).find());
+    }
+
+    private void openPreview3D() {
+        if (!simReady) {
+            status.setText("シミュレータの準備中です。少し待ってからもう一度押してください");
+            return;
+        }
+        File exe = new File(VIEWER_EXE);
+        if (!exe.isFile()) {
+            status.setText("3Dビューアが見つかりません: " + exe.getAbsolutePath()
+                    + "（viewer フォルダで cargo build --release を実行してください）");
+            return;
+        }
+        String json;
+        try {
+            JSObject win = (JSObject) simEngine.executeScript("window");
+            win.setMember("pendingCode", codeText());
+            Object v = simEngine.executeScript("simulate(pendingCode)");
+            if (!(v instanceof String)) {
+                status.setText("コードの実行結果を取得できませんでした");
+                return;
+            }
+            json = (String) v;
+        } catch (Exception ex) {
+            status.setText("コードを実行できませんでした: " + ex.getMessage());
+            return;
+        }
+        try {
+            File out = File.createTempFile("makecode-preview", ".json");
+            out.deleteOnExit();
+            java.nio.file.Files.writeString(out.toPath(), json, StandardCharsets.UTF_8);
+            if (previewProcess != null && previewProcess.isAlive()) previewProcess.destroy();
+            previewProcess = new ProcessBuilder(exe.getAbsolutePath(), out.getAbsolutePath()).start();
+            status.setText("3Dプレビューを開きました（別ウィンドウ）");
+        } catch (Exception ex) {
+            status.setText("3Dプレビューを起動できませんでした: " + ex.getMessage());
+        }
+    }
+
+    @Override
+    public void stop() {
+        if (previewProcess != null) previewProcess.destroy();
     }
 
     private void useFallbackEditor(String reason) {
@@ -459,7 +660,7 @@ public class MakeCodeBlankApp extends Application {
             if (editorReady) return;
             editorReady = true;
             System.out.println("[editor] " + info);
-            Platform.runLater(() -> setEditorCode(SAMPLE));
+            Platform.runLater(() -> setEditorCode(codeArea.getText()));
         }
 
         public void onEditorInfo(String info) {
@@ -472,6 +673,10 @@ public class MakeCodeBlankApp extends Application {
 
         public void onCodeError(String raw) {
             Platform.runLater(() -> markCodeError(raw));
+        }
+
+        public void onCodeShape(boolean hasPlace) {
+            if (previewBtn != null) previewBtn.setDisable(!hasPlace);
         }
 
         public void onExport(String q, String a) {

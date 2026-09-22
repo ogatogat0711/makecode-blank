@@ -57,7 +57,10 @@ const API_WORDS = [
   "AgentInspection.Block", "AgentDetection.Block", "LOCAL_PLAYER",
 ];
 
+const PLACE_RE = /(agent|blocks)\s*\.\s*place\s*\(/;
+
 let editor = null;
+let shapeTimer = null;
 let pendingValue = "";
 let ready = false;
 let failed = false;
@@ -121,7 +124,10 @@ function createEditor() {
       renderWhitespace: "selection",
       mouseWheelZoom: true,
     });
-    editor.onDidChangeModelContent(clearErrorMarkers);
+    editor.onDidChangeModelContent(() => {
+      clearErrorMarkers();
+      scheduleShapeReport();
+    });
     ready = true;
     toJava("onEditorReady", "monaco " + MONACO_VERSION + " / " + navigator.userAgent);
     enableSyntaxCheck();
@@ -192,6 +198,16 @@ function getCode() {
 function setCode(code) {
   pendingValue = String(code);
   if (editor) editor.setValue(pendingValue);
+  reportShape();
+}
+
+function reportShape() {
+  toJava("onCodeShape", PLACE_RE.test(getCode()));
+}
+
+function scheduleShapeReport() {
+  if (shapeTimer) clearTimeout(shapeTimer);
+  shapeTimer = setTimeout(reportShape, 300);
 }
 
 function setErrorMarker(line, column, message) {
