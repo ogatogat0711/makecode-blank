@@ -53,15 +53,17 @@ function onRendered(msg) {
   const out = document.getElementById("out");
   if (!msg.svg) {
     out.innerHTML = "";
+    toJava("onRendered", false);
     toJava("onError", "ブロックへの変換に失敗しました" + (msg.error ? "：" + msg.error : ""));
     toJava("onCodeError", String(msg.error || ""));
     return;
   }
   out.innerHTML = msg.svg;
   const svg = out.querySelector("svg");
-  if (!svg) { toJava("onError", "SVGが見つかりません"); return; }
+  if (!svg) { toJava("onRendered", false); toJava("onError", "SVGが見つかりません"); return; }
   prepareFields(svg);
   prepareLayout(svg);
+  toJava("onRendered", true);
   status("変換完了：空欄候補 " + fieldStats.all + " 個。引数のクリックで空欄を切り替え、ブロックの地の部分をドラッグすると位置を動かせます。");
 }
 
@@ -334,7 +336,7 @@ function normalizeLayout(){
   applySize(svg, Math.ceil(b.maxX - b.minX), Math.ceil(b.maxY - b.minY));
 }
 
-function arrangeStacks(vertical){
+function arrangeStacks(vertical, quiet){
   if (!canvasEl || !stacks.length){
     toJava("onError", "先にブロック変換をしてください");
     return;
@@ -356,11 +358,11 @@ function arrangeStacks(vertical){
     }
   });
   normalizeLayout();
-  status((vertical ? "縦" : "横") + "に並べました（" + items.length + " 個のブロック列）");
+  if (!quiet) status((vertical ? "縦" : "横") + "に並べました（" + items.length + " 個のブロック列）");
 }
 
-function arrangeVertical()   { arrangeStacks(true); }
-function arrangeHorizontal() { arrangeStacks(false); }
+function arrangeVertical(quiet)   { arrangeStacks(true, quiet); }
+function arrangeHorizontal(quiet) { arrangeStacks(false, quiet); }
 
 function resetLayout(){
   const svg = document.querySelector("#out svg");
@@ -407,8 +409,8 @@ function exportImages(scale) {
   rs.forEach((r, i) => setShown(r, saved[i]));
 
   let q;
-  toPng(questionXml, w, h, scale, "問題")
-    .then(res => { q = res; return toPng(answerXml, w, h, scale, "解答") })
+  toPng(questionXml, w, h, scale)
+    .then(res => { q = res; return toPng(answerXml, w, h, scale) })
     .then(a => toJava("onExport", q, a))
     .catch(e => toJava("onError", String(e)));
 }
@@ -422,21 +424,17 @@ function serialize(svg, w, h, scale) {
   return new XMLSerializer().serializeToString(c);
 }
 
-function toPng(xml, w, h, scale, title) {
+function toPng(xml, w, h, scale) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const head = 40 * scale;
       const canvas = document.createElement("canvas");
       canvas.width = w * scale;
-      canvas.height = h * scale + head;
+      canvas.height = h * scale;
       const ctx = canvas.getContext("2d");
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#000000";
-      ctx.font = "bold " + (20 * scale) + "px sans-serif";
-      ctx.fillText(title, 0, 26 * scale);
-      ctx.drawImage(img, 0, head, w * scale, h * scale);
+      ctx.drawImage(img, 0, 0, w * scale, h * scale);
       const data = canvas.toDataURL("image/png").split(",")[1];
       canvas.width = 0;
       canvas.height = 0;

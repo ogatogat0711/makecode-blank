@@ -2,6 +2,9 @@ package app;
 
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.beans.property.BooleanProperty;
+import javafx.beans.property.SimpleBooleanProperty;
+import javafx.collections.FXCollections;
 import javafx.concurrent.Worker;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -14,6 +17,7 @@ import javafx.scene.Parent;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
@@ -24,12 +28,8 @@ import javafx.scene.web.WebView;
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 import netscape.javascript.JSObject;
-import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.pdmodel.PDPage;
-import org.apache.pdfbox.pdmodel.PDPageContentStream;
-import org.apache.pdfbox.pdmodel.common.PDRectangle;
-import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 
+import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -38,6 +38,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
+import java.util.prefs.Preferences;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -55,6 +56,18 @@ public class MakeCodeBlankApp extends Application {
     static final Pattern PLACE_CALL = Pattern.compile("(agent|blocks)\\s*\\.\\s*place\\s*\\(");
     static final String TITLE = "MakeCode設計書メーカー";
     static final String VIEWER_EXE = "viewer/target/release/makecode-viewer.exe";
+    static final String PREF_ZOOM = "defaultZoom";
+    static final String PREF_LAYOUT = "defaultLayout";
+    static final String ZOOM_FIT = "fit";
+    static final String[] ZOOM_LABELS = { "ウィンドウに合わせる", "50%", "75%", "100%", "125%", "150%", "200%" };
+    static final String[] ZOOM_VALUES = { ZOOM_FIT, "0.5", "0.75", "1.0", "1.25", "1.5", "2.0" };
+    static final String[] LAYOUT_LABELS = { "MakeCode の配置のまま", "縦に並べる", "横に並べる" };
+    static final String[] LAYOUT_VALUES = { "none", "vertical", "horizontal" };
+    static final String PREF_TITLE_Q = "pdfTitleQuestion";
+    static final String PREF_TITLE_A = "pdfTitleAnswer";
+    static final String PREF_PDF_DIALOG = "pdfShowDialog";
+    static final String DEFAULT_TITLE_Q = "問題";
+    static final String DEFAULT_TITLE_A = "解答";
 
     static final String SAMPLE = """
             player.onChat("run", function () {
@@ -89,8 +102,10 @@ public class MakeCodeBlankApp extends Application {
     private Parent editorRoot;
     private Parent ocrRoot;
     private Stage stage;
-    private File pendingPdf;
+    private boolean exporting;
     private double zoom = 1.0;
+    private final BooleanProperty rendered = new SimpleBooleanProperty(false);
+    private final Preferences prefs = Preferences.userNodeForPackage(MakeCodeBlankApp.class);
     private final HandwritingOcr ocr = new HandwritingOcr();
     private BufferedImage ocrImage;
     private ImageView ocrView;
@@ -110,7 +125,7 @@ public class MakeCodeBlankApp extends Application {
 
         scene = new Scene(homeRoot, 1200, 750);
         scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
-            if (!e.isControlDown() || scene.getRoot() != editorRoot) return;
+            if (!e.isControlDown() || scene.getRoot() != editorRoot || !rendered.get()) return;
             KeyCode c = e.getCode();
             if (c == KeyCode.PLUS || c == KeyCode.ADD || c == KeyCode.EQUALS) {
                 stepZoom(1);
@@ -122,8 +137,85 @@ public class MakeCodeBlankApp extends Application {
         });
 
         stage.setScene(scene);
+        applyDefaultZoom();
         showHome();
         stage.show();
+    }
+
+    private String defaultZoom() {
+        return prefs.get(PREF_ZOOM, "1.0");
+    }
+
+    private String defaultLayout() {
+        return prefs.get(PREF_LAYOUT, "none");
+    }
+
+    private void applyDefaultZoom() {
+        String z = defaultZoom();
+        if (ZOOM_FIT.equals(z)) {
+            if (rendered.get()) fitZoom();
+            return;
+        }
+        try {
+            applyZoom(Double.parseDouble(z));
+        } catch (NumberFormatException ignored) {
+        }
+    }
+
+    private void applyRenderDefaults() {
+        String layout = defaultLayout();
+        if ("vertical".equals(layout)) js("arrangeVertical(true)");
+        else if ("horizontal".equals(layout)) js("arrangeHorizontal(true)");
+        if (ZOOM_FIT.equals(defaultZoom())) fitZoom();
+    }
+
+    private static int indexOf(String[] values, String v, int fallback) {
+        for (int i = 0; i < values.length; i++) if (values[i].equals(v)) return i;
+        return fallback;
+    }
+
+    private void openSettings() {
+        TextField invite = new TextField(ocr.inviteCode());
+        invite.setPromptText("招待コード");
+        invite.setPrefColumnCount(22);
+        ComboBox<String> zoomBox = new ComboBox<>(FXCollections.observableArrayList(ZOOM_LABELS));
+        zoomBox.getSelectionModel().select(indexOf(ZOOM_VALUES, defaultZoom(), 3));
+        ComboBox<String> layoutBox = new ComboBox<>(FXCollections.observableArrayList(LAYOUT_LABELS));
+        layoutBox.getSelectionModel().select(indexOf(LAYOUT_VALUES, defaultLayout(), 0));
+
+        GridPane grid = new GridPane();
+        grid.setHgap(12);
+        grid.setVgap(10);
+        grid.setPadding(new Insets(16));
+        grid.addRow(0, new Label("招待コード（画像認識用）"), invite);
+        grid.addRow(1, new Label("既定の表示倍率"), zoomBox);
+        grid.addRow(2, new Label("変換後の既定の配置"), layoutBox);
+
+        TextField titleQ = new TextField(prefs.get(PREF_TITLE_Q, DEFAULT_TITLE_Q));
+        titleQ.setPromptText("空欄なら見出しなし");
+        TextField titleA = new TextField(prefs.get(PREF_TITLE_A, DEFAULT_TITLE_A));
+        titleA.setPromptText("空欄なら見出しなし");
+        CheckBox showPdfDialog = new CheckBox("PDF出力時に見出しの編集・プレビュー画面を表示する");
+        showPdfDialog.setSelected(prefs.getBoolean(PREF_PDF_DIALOG, true));
+        grid.add(new Separator(), 0, 3, 2, 1);
+        grid.addRow(4, new Label("PDF の見出し（問題）"), titleQ);
+        grid.addRow(5, new Label("PDF の見出し（解答）"), titleA);
+        grid.add(showPdfDialog, 0, 6, 2, 1);
+
+        Dialog<ButtonType> dialog = new Dialog<>();
+        dialog.initOwner(stage);
+        dialog.setTitle("設定");
+        dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.OK, ButtonType.CANCEL);
+        if (dialog.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) return;
+
+        ocr.setInviteCode(invite.getText());
+        prefs.put(PREF_ZOOM, ZOOM_VALUES[Math.max(0, zoomBox.getSelectionModel().getSelectedIndex())]);
+        prefs.put(PREF_LAYOUT, LAYOUT_VALUES[Math.max(0, layoutBox.getSelectionModel().getSelectedIndex())]);
+        prefs.put(PREF_TITLE_Q, titleQ.getText().strip());
+        prefs.put(PREF_TITLE_A, titleA.getText().strip());
+        prefs.putBoolean(PREF_PDF_DIALOG, showPdfDialog.isSelected());
+        applyDefaultZoom();
     }
 
     private void showScreen(Parent root, String subtitle) {
@@ -146,14 +238,19 @@ public class MakeCodeBlankApp extends Application {
         codeBtn.setOnAction(e -> showEditor());
         Button ocrBtn = homeChoice("画像認識から",
                 "手書きの設計書の画像から作ります");
-        ocrBtn.setOnAction(e -> showOcr());
+        ocrBtn.setOnAction(e -> enterOcr());
 
         VBox box = new VBox(16, title, lead, new Separator(), codeBtn, ocrBtn);
         box.setAlignment(Pos.CENTER);
         box.setPadding(new Insets(40));
         box.setMaxWidth(Region.USE_PREF_SIZE);
 
-        StackPane pane = new StackPane(box);
+        Button settingsBtn = Icons.button(Icons.gear(), "設定");
+        settingsBtn.setOnAction(e -> openSettings());
+        StackPane.setAlignment(settingsBtn, Pos.TOP_RIGHT);
+        StackPane.setMargin(settingsBtn, new Insets(12));
+
+        StackPane pane = new StackPane(box, settingsBtn);
         pane.setStyle("-fx-background-color: #fafafa;");
         return pane;
     }
@@ -184,8 +281,6 @@ public class MakeCodeBlankApp extends Application {
         ocrRunBtn.setDisable(true);
         ocrRunBtn.setStyle("-fx-font-weight: bold;");
         ocrRunBtn.setOnAction(e -> runOcr());
-        Button inviteBtn = new Button("招待コード…");
-        inviteBtn.setOnAction(e -> askInviteCode());
         Label server = new Label(HandwritingOcr.hasServer()
                 ? "認識サーバー設定済"
                 : "認識サーバー未設定");
@@ -193,7 +288,7 @@ public class MakeCodeBlankApp extends Application {
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
         ToolBar bar = new ToolBar(backBtn, new Separator(), ocrOpenBtn, ocrRotateBtn,
-                new Separator(), ocrRunBtn, spacer, server, inviteBtn);
+                new Separator(), ocrRunBtn, spacer, server);
 
         Label hint = new Label("手書きの設計書の写真を開いてください");
         hint.setStyle("-fx-font-size: 15px; -fx-text-fill: #666;");
@@ -260,22 +355,32 @@ public class MakeCodeBlankApp extends Application {
         ocrRunBtn.setDisable(busy || ocrImage == null);
     }
 
-    private boolean askInviteCode() {
+    private boolean askInviteCode(String header) {
         TextInputDialog dialog = new TextInputDialog(ocr.inviteCode());
         dialog.initOwner(stage);
         dialog.setTitle("招待コード");
-        dialog.setHeaderText("招待コードを入力してください");
+        dialog.setHeaderText(header);
         dialog.setContentText("招待コード:");
-        String code = dialog.showAndWait().map(String::strip).orElse(null);
-        if (code == null) return false;
+        String code = dialog.showAndWait().map(String::strip).orElse("");
+        if (code.isEmpty()) return false;
         ocr.setInviteCode(code);
-        ocrStatus.setText(code.isEmpty() ? "招待コードを消去しました" : "招待コードを保存しました");
-        return !code.isEmpty();
+        return true;
+    }
+
+    private void enterOcr() {
+        if (ocr.inviteCode().isEmpty()
+                && !askInviteCode("画像認識を使うには招待コードが必要です。招待コードを入力してください")) {
+            return;
+        }
+        showOcr();
     }
 
     private void runOcr() {
         if (ocrImage == null) return;
-        if (ocr.inviteCode().isEmpty() && !askInviteCode()) return;
+        if (ocr.inviteCode().isEmpty()) {
+            showHome();
+            return;
+        }
         BufferedImage img = ocrImage;
         setOcrBusy(true);
         ocrStatus.setText("認識中です…");
@@ -297,7 +402,11 @@ public class MakeCodeBlankApp extends Application {
         setOcrBusy(false);
         if (ex.badInvite) {
             ocr.setInviteCode("");
-            ocrStatus.setText(ex.getMessage() + "。「招待コード…」から入力し直してください");
+            if (askInviteCode(ex.getMessage() + "。招待コードを入力し直してください")) {
+                ocrStatus.setText("招待コードを保存しました。もう一度「認識する」を押してください");
+            } else {
+                showHome();
+            }
         } else {
             ocrStatus.setText("認識できませんでした: " + ex.getMessage());
         }
@@ -370,19 +479,18 @@ public class MakeCodeBlankApp extends Application {
         });
         engine.load(getClass().getResource("/host.html").toExternalForm());
 
-        Button renderBtn = new Button("ブロックに変換");
+        Button renderBtn = Icons.button(Icons.convert(), "ブロックに変換");
         renderBtn.setOnAction(e -> renderCode());
 
-        previewBtn = new Button("3Dプレビュー");
+        previewBtn = Icons.button(Icons.cube(), "3Dプレビュー");
         previewBtn.setDisable(true);
         previewBtn.setOnAction(e -> openPreview3D());
-    
 
         Button blankBtn = new Button("引数をすべて空欄");
         blankBtn.setOnAction(e -> js("blankAll()"));
         Button clearBtn = new Button("空欄を解除");
         clearBtn.setOnAction(e -> js("clearBlanks()"));
-        Button pdfBtn = new Button("PDF出力（問題＋解答）");
+        Button pdfBtn = Icons.button(Icons.pdf(), "PDF出力（問題＋解答）");
         pdfBtn.setOnAction(e -> exportPdf());
 
         Button svgBtn = new Button("SVG保存");
@@ -404,25 +512,33 @@ public class MakeCodeBlankApp extends Application {
         zoomLabel.setMinWidth(48);
         zoomLabel.setAlignment(Pos.CENTER);
 
-        Button backBtn = new Button("← 最初の画面");
+        Button backBtn = new Button("← 戻る");
         backBtn.setOnAction(e -> showHome());
 
+        for (Button b : new Button[] { blankBtn, clearBtn, pdfBtn, svgBtn, vertBtn, horizBtn, resetPosBtn,
+                zoomOutBtn, zoomInBtn, fitBtn }) {
+            b.disableProperty().bind(rendered.not());
+        }
+        zoomLabel.disableProperty().bind(rendered.not());
+
         ToolBar bar = new ToolBar(backBtn, new Separator(), renderBtn, previewBtn, new Separator(), blankBtn, clearBtn,
-                new Separator(), new Label("配置: "), vertBtn, horizBtn, resetPosBtn,
-                new Separator(), pdfBtn, new Separator(), svgBtn);
-        ToolBar kindBar = new ToolBar(new Label("表示倍率: "), zoomOutBtn, zoomLabel, zoomInBtn, fitBtn);
+                new Separator(), pdfBtn, svgBtn);
+        ToolBar viewBar = new ToolBar(new Label("表示倍率: "), zoomOutBtn, zoomLabel, zoomInBtn, fitBtn,
+                new Separator(), new Label("配置: "), vertBtn, horizBtn, resetPosBtn);
 
         view.addEventFilter(ScrollEvent.SCROLL, e -> {
-            if (!e.isControlDown() || e.getDeltaY() == 0) return;
+            if (!e.isControlDown() || e.getDeltaY() == 0 || !rendered.get()) return;
             applyZoom(e.getDeltaY() > 0 ? zoom * 1.1 : zoom / 1.1);
             e.consume();
         });
 
-        split = new SplitPane(editorView, view);
+        BorderPane previewPane = new BorderPane(view);
+        previewPane.setTop(viewBar);
+        split = new SplitPane(editorView, previewPane);
         split.setDividerPositions(0.35);
 
         BorderPane root = new BorderPane(split);
-        root.setTop(new VBox(bar, kindBar));
+        root.setTop(bar);
         BorderPane.setMargin(status, new Insets(4, 8, 4, 8));
         root.setBottom(status);
         return root;
@@ -597,48 +713,72 @@ public class MakeCodeBlankApp extends Application {
     }
 
     private void exportPdf() {
+        if (exporting) return;
+        exporting = true;
+        status.setText("PDF用の画像を作成中…");
+        js("exportImages(" + SCALE + ")");
+    }
+
+    private void onPdfImages(String questionB64, String answerB64) {
+        BufferedImage question, answer;
+        try {
+            question = decodePng(questionB64);
+            answer = decodePng(answerB64);
+        } catch (IOException ex) {
+            exporting = false;
+            status.setText("PDFの作成に失敗しました: " + ex.getMessage());
+            return;
+        }
+
+        String questionTitle = prefs.get(PREF_TITLE_Q, DEFAULT_TITLE_Q);
+        String answerTitle = prefs.get(PREF_TITLE_A, DEFAULT_TITLE_A);
+        if (prefs.getBoolean(PREF_PDF_DIALOG, true)) {
+            String[] titles = PdfExport.editTitles(stage, question, answer, questionTitle, answerTitle, SCALE);
+            if (titles == null) {
+                exporting = false;
+                status.setText("PDF出力をキャンセルしました");
+                return;
+            }
+            questionTitle = titles[0];
+            answerTitle = titles[1];
+        }
+
         FileChooser fc = new FileChooser();
         fc.setTitle("PDFの保存先");
         fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("PDF", "*.pdf"));
         fc.setInitialFileName("worksheet.pdf");
-        File f = fc.showSaveDialog(stage);
-        if (f == null) return;
-        pendingPdf = f;
-        status.setText("PDFを作成中…");
-        js("exportImages(" + SCALE + ")");
+        File file = fc.showSaveDialog(stage);
+        if (file == null) {
+            exporting = false;
+            status.setText("PDF出力をキャンセルしました");
+            return;
+        }
+
+        String qt = questionTitle, at = answerTitle;
+        status.setText("PDFを保存中…");
+        Thread worker = new Thread(() -> {
+            String message;
+            try {
+                PdfExport.write(file, PdfExport.compose(question, qt, SCALE),
+                        PdfExport.compose(answer, at, SCALE), SCALE);
+                message = "保存しました: " + file.getAbsolutePath() + "（1ページ目：問題 / 2ページ目：解答）";
+            } catch (Exception ex) {
+                message = "PDFの保存に失敗しました: " + ex.getMessage();
+            }
+            String done = message;
+            Platform.runLater(() -> {
+                exporting = false;
+                status.setText(done);
+            });
+        }, "pdf");
+        worker.setDaemon(true);
+        worker.start();
     }
 
-    private void writePdf(String questionB64, String answerB64) {
-        if (pendingPdf == null) return;
-        try (PDDocument doc = new PDDocument()) {
-            addImagePage(doc, Base64.getDecoder().decode(questionB64), "question");
-            addImagePage(doc, Base64.getDecoder().decode(answerB64), "answer");
-            doc.save(pendingPdf);
-            status.setText("保存しました: " + pendingPdf.getAbsolutePath() + "（1ページ目：問題 / 2ページ目：解答）");
-        } catch (Exception ex) {
-            status.setText("PDFの保存に失敗しました: " + ex.getMessage());
-        } finally {
-            pendingPdf = null;
-        }
-    }
-
-    private static void addImagePage(PDDocument doc, byte[] png, String name) throws Exception {
-        PDImageXObject img = PDImageXObject.createFromByteArray(doc, png, name);
-        PDPage page = new PDPage(PDRectangle.A4);
-        doc.addPage(page);
-
-        float maxW = page.getMediaBox().getWidth() - 2 * MARGIN;
-        float maxH = page.getMediaBox().getHeight() - 2 * MARGIN;
-        // 画面上の1px = 0.75pt として等倍配置、はみ出す場合のみ縮小
-        float w = img.getWidth() / (float) SCALE * 0.75f;
-        float h = img.getHeight() / (float) SCALE * 0.75f;
-        float k = Math.min(1f, Math.min(maxW / w, maxH / h));
-        w *= k;
-        h *= k;
-
-        try (PDPageContentStream cs = new PDPageContentStream(doc, page)) {
-            cs.drawImage(img, MARGIN, page.getMediaBox().getHeight() - MARGIN - h, w, h);
-        }
+    private static BufferedImage decodePng(String b64) throws IOException {
+        BufferedImage img = ImageIO.read(new ByteArrayInputStream(Base64.getDecoder().decode(b64)));
+        if (img == null) throw new IOException("画像を読み込めませんでした");
+        return img;
     }
 
     /** JavaScript から呼び出されるメソッド群（public 必須） */
@@ -653,7 +793,7 @@ public class MakeCodeBlankApp extends Application {
 
         public void onError(String s) {
             status.setText("エラー: " + s);
-            pendingPdf = null;
+            exporting = false;
         }
 
         public void onEditorReady(String info) {
@@ -679,8 +819,13 @@ public class MakeCodeBlankApp extends Application {
             if (previewBtn != null) previewBtn.setDisable(!hasPlace);
         }
 
+        public void onRendered(boolean ok) {
+            rendered.set(ok);
+            if (ok) Platform.runLater(MakeCodeBlankApp.this::applyRenderDefaults);
+        }
+
         public void onExport(String q, String a) {
-            writePdf(q, a);
+            Platform.runLater(() -> onPdfImages(q, a));
         }
 
         public void onSvg(String xml){
