@@ -55,7 +55,9 @@ public class MakeCodeBlankApp extends Application {
     static final Pattern ERROR_POS = Pattern.compile("\\((\\d+)\\s*,\\s*(\\d+)\\)|:(\\d+):(\\d+)|(?:line|行)\\s*(\\d+)");
     static final Pattern PLACE_CALL = Pattern.compile("(agent|blocks)\\s*\\.\\s*place\\s*\\(");
     static final String TITLE = "MakeCode設計書メーカー";
-    static final String VIEWER_EXE = "viewer/target/release/makecode-viewer.exe";
+    static final String VIEWER_NAME = "makecode-viewer.exe";
+    static final String VIEWER_DEV = "viewer/target/release/" + VIEWER_NAME;
+    static final String VIEWER_PROPERTY = "makecode.viewer";
     static final String PREF_ZOOM = "defaultZoom";
     static final String PREF_LAYOUT = "defaultLayout";
     static final String ZOOM_FIT = "fit";
@@ -457,9 +459,11 @@ public class MakeCodeBlankApp extends Application {
         editorEngine = editorView.getEngine();
         editorEngine.getLoadWorker().stateProperty().addListener((obs, oldS, s) -> {
             if (s == Worker.State.SUCCEEDED) {
-                JSObject win = (JSObject) editorEngine.executeScript("window");
-                win.setMember("bridge", bridge);
-                editorEngine.executeScript("notifyEditorIfReady()");
+                Platform.runLater(() -> {
+                    JSObject win = (JSObject) editorEngine.executeScript("window");
+                    win.setMember("bridge", bridge);
+                    editorEngine.executeScript("notifyEditorIfReady()");
+                });
             } else if (s == Worker.State.FAILED) {
                 useFallbackEditor("エディタのページを読み込めませんでした");
             }
@@ -470,9 +474,11 @@ public class MakeCodeBlankApp extends Application {
         engine = view.getEngine();
         engine.getLoadWorker().stateProperty().addListener((obs, oldS, s) -> {
             if (s == Worker.State.SUCCEEDED) {
-                JSObject win = (JSObject) engine.executeScript("window");
-                win.setMember("bridge", bridge);
-                engine.executeScript("notifyIfReady()");
+                Platform.runLater(() -> {
+                    JSObject win = (JSObject) engine.executeScript("window");
+                    win.setMember("bridge", bridge);
+                    engine.executeScript("notifyIfReady()");
+                });
             } else if (s == Worker.State.FAILED) {
                 status.setText("ページの読み込みに失敗しました");
             }
@@ -639,10 +645,10 @@ public class MakeCodeBlankApp extends Application {
             status.setText("シミュレータの準備中です。少し待ってからもう一度押してください");
             return;
         }
-        File exe = new File(VIEWER_EXE);
-        if (!exe.isFile()) {
-            status.setText("3Dビューアが見つかりません: " + exe.getAbsolutePath()
-                    + "（viewer フォルダで cargo build --release を実行してください）");
+        File exe = viewerExe();
+        if (exe == null) {
+            status.setText("3Dビューア（" + VIEWER_NAME + "）が見つかりません"
+                    + "（開発中は viewer フォルダで cargo build --release を実行してください）");
             return;
         }
         String json;
@@ -668,6 +674,28 @@ public class MakeCodeBlankApp extends Application {
             status.setText("3Dプレビューを開きました（別ウィンドウ）");
         } catch (Exception ex) {
             status.setText("3Dプレビューを起動できませんでした: " + ex.getMessage());
+        }
+    }
+
+    private static File viewerExe() {
+        String prop = System.getProperty(VIEWER_PROPERTY);
+        if (prop != null && !prop.isBlank() && new File(prop).isFile()) return new File(prop);
+        File dir = appDir();
+        if (dir != null) {
+            File beside = new File(dir, VIEWER_NAME);
+            if (beside.isFile()) return beside;
+        }
+        File dev = new File(VIEWER_DEV);
+        return dev.isFile() ? dev : null;
+    }
+
+    private static File appDir() {
+        try {
+            File src = new File(MakeCodeBlankApp.class.getProtectionDomain()
+                    .getCodeSource().getLocation().toURI());
+            return src.isFile() ? src.getParentFile() : src;
+        } catch (Exception ex) {
+            return null;
         }
     }
 

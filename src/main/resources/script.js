@@ -69,7 +69,7 @@ function onRendered(msg) {
 
 const DIRECTION_WORDS = ["前", "後ろ", "左", "右", "上", "下"];
 const BLANK_FILL = "#ffffff";
-const BLANK_STROKE = "#ffffff";
+const BLANK_STROKE = "#0303f0";
 
 function hasClass(el, c){
   return el && el.classList && el.classList.contains(c);
@@ -128,7 +128,77 @@ function setShown(r, on){
 
 let fieldStats = { all: 0, kinds: {} }
 
-// 引数（編集可能フィールド）ごとに、白塗りの四角を重ねておく（初期状態は非表示）
+const BLANK_PAD = 1;
+
+function boxIn(host, el, svg) {
+  const bb = safeBBox(el);
+  if (!bb) return null;
+  let m = null;
+  try {
+    const hm = host.getCTM(), em = el.getCTM();
+    if (hm && em) m = hm.inverse().multiply(em);
+  } catch (e) { /* ignore */ }
+  if (!m) return { x: bb.x, y: bb.y, w: bb.width, h: bb.height };
+  const p = svg.createSVGPoint();
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  [[bb.x, bb.y], [bb.x + bb.width, bb.y], [bb.x, bb.y + bb.height], [bb.x + bb.width, bb.y + bb.height]]
+    .forEach(c => {
+      p.x = c[0];
+      p.y = c[1];
+      const q = p.matrixTransform(m);
+      minX = Math.min(minX, q.x);
+      minY = Math.min(minY, q.y);
+      maxX = Math.max(maxX, q.x);
+      maxY = Math.max(maxY, q.y);
+    });
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+function unionBox(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+  return { x: x, y: y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
+}
+
+function sticksOut(inner, outer) {
+  if (!inner || !outer) return false;
+  return inner.x < outer.x - 0.5 || inner.y < outer.y - 0.5
+    || inner.x + inner.w > outer.x + outer.w + 0.5 || inner.y + inner.h > outer.y + outer.h + 0.5;
+}
+
+function coverOfShape(shape) {
+  const c = shape.cloneNode(false);
+  c.removeAttribute("id");
+  c.removeAttribute("class");
+  c.removeAttribute("filter");
+  c.removeAttribute("style");
+  return c;
+}
+
+function coverOfBox(box) {
+  const r = document.createElementNS(NS, "rect");
+  r.setAttribute("x", box.x - BLANK_PAD);
+  r.setAttribute("y", box.y - BLANK_PAD);
+  r.setAttribute("width", box.w + BLANK_PAD * 2);
+  r.setAttribute("height", box.h + BLANK_PAD * 2);
+  const rad = (box.h + BLANK_PAD * 2) / 2;
+  r.setAttribute("rx", rad);
+  r.setAttribute("ry", rad);
+  return r;
+}
+
+function fieldShape(f, pill) {
+  if (pill) return pill;
+  const rect = f.querySelector("rect.blocklyFieldRect");
+  if (rect && rect.parentNode === f) {
+    const b = safeBBox(rect);
+    if (b && b.width > 0 && b.height > 0) return rect;
+  }
+  return null;
+}
+
+// 引数（編集可能フィールド）ごとに、白塗りの図形を重ねておく（初期状態は非表示）
 function prepareFields(svg) {
   const kinds = { repeat: 0, number: 0, direction: 0, variable: 0, text: 0, other: 0 };
 
@@ -140,30 +210,21 @@ function prepareFields(svg) {
     const block = parentBlock(f);
     const kind = classify(f, block);
 
-    let host, bb;
-    const path = isPillBlock(block) ? blockPath(block) : null;
-    if (path) {
-      host = block;
-      bb = safeBBox(path);
-    }
-    else{
-      host = f;
-      bb = safeBBox(f);
-    }
+    const pill = isPillBlock(block) ? blockPath(block) : null;
+    const host = pill ? block : f;
+    const shape = fieldShape(f, pill);
+    const base = boxIn(host, shape || (pill ? pill : f), svg);
+    if (!base || base.w === 0 || base.h === 0) return;
 
-    if (!bb || bb.width === 0 || bb.height === 0) return;
+    let content = null;
+    f.querySelectorAll("text, image").forEach(el => {
+      content = unionBox(content, boxIn(host, el, svg));
+    });
 
-    const pad = 1;
-    const r = document.createElementNS(NS, "rect");
-    r.setAttribute("x", bb.x - pad);
-    r.setAttribute("y", bb.y - pad);
-    r.setAttribute("width", bb.width + pad * 2);
-    r.setAttribute("height", bb.height + pad * 2);
+    const r = (shape && !sticksOut(content, base))
+      ? coverOfShape(shape)
+      : coverOfBox(unionBox(base, content));
 
-    const rad = (bb.height + pad * 2) / 2;
-
-    r.setAttribute("rx", rad);
-    r.setAttribute("ry", rad);
     r.setAttribute("data-blank", "1");
     r.setAttribute("data-kind", kind);
 
@@ -189,7 +250,7 @@ function prepareFields(svg) {
   return all;
 }
 
-function blanks() { return Array.from(document.querySelectorAll("#out rect[data-blank]")); }
+function blanks() { return Array.from(document.querySelectorAll("#out [data-blank]")); }
 function blankKinds(csv) {
   const set = String(csv).split(",").map(x => x.trim()).filter(x => x);
   blanks().forEach(r => setShown(r, set.includes(r.getAttribute("data-kind"))));
