@@ -123,7 +123,10 @@ function isPillBlock(block){
 
 function setShown(r, on){
   r.setAttribute("data-on", on ? "1" : "0");
-  r.style.setProperty("display", on ? "inline": "none", "important")
+  r.style.setProperty("display", on ? "inline": "none", "important");
+  (r.hiddenContent || []).forEach(el => {
+    el.style.setProperty("visibility", on ? "hidden" : "visible", "important");
+  });
 }
 
 let fieldStats = { all: 0, kinds: {} }
@@ -159,12 +162,6 @@ function unionBox(a, b) {
   if (!b) return a;
   const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
   return { x: x, y: y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
-}
-
-function sticksOut(inner, outer) {
-  if (!inner || !outer) return false;
-  return inner.x < outer.x - 0.5 || inner.y < outer.y - 0.5
-    || inner.x + inner.w > outer.x + outer.w + 0.5 || inner.y + inner.h > outer.y + outer.h + 0.5;
 }
 
 function coverOfShape(shape) {
@@ -216,14 +213,14 @@ function prepareFields(svg) {
     const base = boxIn(host, shape || (pill ? pill : f), svg);
     if (!base || base.w === 0 || base.h === 0) return;
 
-    let content = null;
-    f.querySelectorAll("text, image").forEach(el => {
-      content = unionBox(content, boxIn(host, el, svg));
+    const content = Array.from(f.querySelectorAll("text, image"));
+    let contentBox = null;
+    content.forEach(el => {
+      contentBox = unionBox(contentBox, boxIn(host, el, svg));
     });
 
-    const r = (shape && !sticksOut(content, base))
-      ? coverOfShape(shape)
-      : coverOfBox(unionBox(base, content));
+    const r = shape ? coverOfShape(shape) : coverOfBox(unionBox(base, contentBox));
+    r.hiddenContent = content;
 
     r.setAttribute("data-blank", "1");
     r.setAttribute("data-kind", kind);
@@ -258,6 +255,7 @@ function blankKinds(csv) {
 function blankAll()    { blanks().forEach(r => setShown(r, true)); }
 function clearBlanks() { blanks().forEach(r => setShown(r, false)); }
 
+const TILE_MAX = 3000;
 const LAYOUT_GAP = 24;
 const ROW_TOLERANCE = 20;
 
@@ -470,10 +468,85 @@ function exportImages(scale) {
   rs.forEach((r, i) => setShown(r, saved[i]));
 
   let q;
-  toPng(questionXml, w, h, scale)
-    .then(res => { q = res; return toPng(answerXml, w, h, scale) })
+  toTiles(questionXml, w, h, scale)
+    .then(res => { q = res; return toTiles(answerXml, w, h, scale) })
     .then(a => toJava("onExport", q, a))
     .catch(e => toJava("onError", String(e)));
+}
+
+function stackBounds(scale) {
+  if (!canvasEl || !stacks.length) return "";
+  const c = getTranslate(canvasEl);
+  const out = [];
+  stacks.forEach(el => {
+    const bb = safeBBox(el);
+    if (!bb) return;
+    const t = getTranslate(el);
+    const top = (t.y + bb.y + c.y) * scale;
+    const bottom = (t.y + bb.y + bb.height + c.y) * scale;
+    out.push(Math.round(top) + "," + Math.round(bottom));
+  });
+  return out.join(";");
+}
+
+function blockTops(scale) {
+  if (!canvasEl) return "";
+  const out = [];
+  const walk = (el, oy) => {
+    for (const child of el.children) {
+      if (child.tagName !== "g") continue;
+      const t = getTranslate(child);
+      const y = oy + t.y;
+      const cls = child.getAttribute("class") || "";
+      if (cls.split(" ").indexOf("blocklyBlock") >= 0) {
+        const bb = safeBBox(child);
+        if (bb) out.push(Math.round((y + bb.y) * scale));
+      }
+      walk(child, y);
+    }
+  };
+  walk(canvasEl, getTranslate(canvasEl).y);
+  return Array.from(new Set(out)).sort((a, b) => a - b).join(",");
+}
+
+function stackSides(scale) {
+  if (!canvasEl || !stacks.length) return "";
+  const c = getTranslate(canvasEl);
+  const out = [];
+  stacks.forEach(el => {
+    const bb = safeBBox(el);
+    if (!bb) return;
+    const t = getTranslate(el);
+    out.push(Math.round((t.x + bb.x + c.x) * scale) + ","
+      + Math.round((t.x + bb.x + bb.width + c.x) * scale));
+  });
+  return out.join(";");
+}
+
+function textHeight(scale) {
+  const svg = document.querySelector("#out svg");
+  if (!svg) return 0;
+  const hs = [];
+  svg.querySelectorAll("text").forEach(el => {
+    const b = boxIn(svg, el, svg);
+    if (b && b.h > 0) hs.push(b.h * scale);
+  });
+  if (!hs.length) return 0;
+  hs.sort((a, b) => a - b);
+  return Math.round(hs[Math.floor(hs.length / 2)]);
+}
+
+function guardBoxes(scale) {
+  const svg = document.querySelector("#out svg");
+  if (!svg) return "";
+  const out = [];
+  svg.querySelectorAll("text, image, [data-blank]").forEach(el => {
+    const b = boxIn(svg, el, svg);
+    if (!b || b.w <= 0 || b.h <= 0) return;
+    out.push(Math.floor(b.x * scale) + "," + Math.floor(b.y * scale) + ","
+      + Math.ceil((b.x + b.w) * scale) + "," + Math.ceil((b.y + b.h) * scale));
+  });
+  return out.join(";");
 }
 
 function serialize(svg, w, h, scale) {
@@ -485,21 +558,33 @@ function serialize(svg, w, h, scale) {
   return new XMLSerializer().serializeToString(c);
 }
 
-function toPng(xml, w, h, scale) {
+function toTiles(xml, w, h, scale) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = w * scale;
-      canvas.height = h * scale;
-      const ctx = canvas.getContext("2d");
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, w * scale, h * scale);
-      const data = canvas.toDataURL("image/png").split(",")[1];
-      canvas.width = 0;
-      canvas.height = 0;
-      resolve(data);
+      const fw = Math.round(w * scale), fh = Math.round(h * scale);
+      const tiles = [];
+      try {
+        for (let y = 0; y < fh; y += TILE_MAX) {
+          for (let x = 0; x < fw; x += TILE_MAX) {
+            const tw = Math.min(TILE_MAX, fw - x), th = Math.min(TILE_MAX, fh - y);
+            const canvas = document.createElement("canvas");
+            canvas.width = tw;
+            canvas.height = th;
+            const ctx = canvas.getContext("2d");
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, tw, th);
+            ctx.drawImage(img, -x, -y, fw, fh);
+            tiles.push({ x: x, y: y, data: canvas.toDataURL("image/png").split(",")[1] });
+            canvas.width = 0;
+            canvas.height = 0;
+          }
+        }
+      } catch (e) {
+        reject("画像化に失敗しました: " + e);
+        return;
+      }
+      resolve(JSON.stringify({ w: fw, h: fh, tiles: tiles }));
     };
     img.onerror = () => reject("SVGの画像化に失敗しました");
     img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);

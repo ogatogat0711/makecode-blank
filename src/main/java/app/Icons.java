@@ -103,6 +103,33 @@ final class Icons {
         return new Group(page, fold, band, label);
     }
 
+    static Node word() {
+        SVGPath page = new SVGPath();
+        page.setContent("M1 0 H12 L18 6 V23 H1 Z");
+        page.setFill(Color.WHITE);
+        page.setStroke(Color.web("#666666"));
+        page.setStrokeWidth(1.1);
+
+        SVGPath fold = new SVGPath();
+        fold.setContent("M12 0 V6 H18");
+        fold.setFill(Color.web("#E4E4E4"));
+        fold.setStroke(Color.web("#666666"));
+        fold.setStrokeWidth(1.1);
+
+        Rectangle band = new Rectangle(-2, 10, 17, 9);
+        band.setArcWidth(2);
+        band.setArcHeight(2);
+        band.setFill(Color.web("#2B579A"));
+
+        Text label = new Text("W");
+        label.setFont(Font.font("Arial", FontWeight.BOLD, 9));
+        label.setFill(Color.WHITE);
+        label.setX(3.5);
+        label.setY(17.8);
+
+        return new Group(page, fold, band, label);
+    }
+
     static Node gear() {
         int teeth = 8;
         double cx = 10, cy = 10, outer = 10, inner = 7.4, hole = 3.4;

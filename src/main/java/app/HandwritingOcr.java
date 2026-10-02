@@ -23,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.prefs.Preferences;
@@ -32,6 +33,7 @@ public class HandwritingOcr {
     static final String DEFAULT_SERVER_URL = "https://makecode-ocr-cwdsacfffa-an.a.run.app/";
     static final String SERVER_URL_ENV = "MAKECODE_OCR_URL";
     static final int MAX_EDGE = 1568;
+    static final int MAX_IMAGES = 6;
     static final float JPEG_QUALITY = 0.9f;
     static final Duration TIMEOUT = Duration.ofSeconds(150);
     static final String PREF_INVITE = "ocrInviteCode";
@@ -121,7 +123,7 @@ public class HandwritingOcr {
         return out.toByteArray();
     }
 
-    Result recognize(BufferedImage image) throws OcrException {
+    Result recognize(List<BufferedImage> images) throws OcrException {
         if (!hasServer()) {
             throw new OcrException("認識サーバーの URL が設定されていません");
         }
@@ -129,11 +131,25 @@ public class HandwritingOcr {
         if (invite.isEmpty()) {
             throw new OcrException("招待コードが設定されていません", true);
         }
+        if (images.isEmpty()) {
+            throw new OcrException("画像がありません");
+        }
+        if (images.size() > MAX_IMAGES) {
+            throw new OcrException("画像は一度に " + MAX_IMAGES + " 枚までです");
+        }
 
         String body;
         try {
-            String b64 = Base64.getEncoder().encodeToString(toJpeg(image, MAX_EDGE));
-            body = JSON.writeValueAsString(Map.of("image", b64, "mediaType", "image/jpeg"));
+            List<Map<String, String>> parts = new ArrayList<>();
+            for (BufferedImage image : images) {
+                parts.add(Map.of(
+                        "image", Base64.getEncoder().encodeToString(toJpeg(image, MAX_EDGE)),
+                        "mediaType", "image/jpeg"));
+            }
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("images", parts);
+            if (parts.size() == 1) payload.putAll(parts.get(0));
+            body = JSON.writeValueAsString(payload);
         } catch (IOException ex) {
             throw new OcrException("画像の変換に失敗しました: " + ex.getMessage());
         }

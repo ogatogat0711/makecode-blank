@@ -45,7 +45,8 @@ if (Test-Path $dist) { throw "$dist を消せませんでした。アプリや�
     --dest $dist `
     --add-modules java.se,jdk.jsobject,jdk.xml.dom,jdk.crypto.ec,jdk.localedata,jdk.unsupported `
     --java-options "-Dfile.encoding=UTF-8" `
-    --java-options "-Dstdout.encoding=UTF-8"
+    --java-options "-Dstdout.encoding=UTF-8" `
+    --java-options "-Dprism.maxvram=1G"
 if ($LASTEXITCODE -ne 0) { throw "jpackage に失敗しました" }
 
 Copy-Item "$PSScriptRoot\使い方.txt" "$dist\$AppName\"

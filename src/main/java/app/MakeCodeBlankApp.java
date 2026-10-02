@@ -10,6 +10,8 @@ import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
+import javafx.scene.input.Clipboard;
+import javafx.scene.input.ClipboardContent;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.input.ScrollEvent;
@@ -29,13 +31,19 @@ import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 import netscape.javascript.JSObject;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import javax.imageio.ImageIO;
+import java.awt.Color;
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.prefs.Preferences;
@@ -44,12 +52,22 @@ import java.util.regex.Pattern;
 
 public class MakeCodeBlankApp extends Application {
 
-    /** 画像化の倍率（大きいほど印刷がきれい、ファイルは重くなる） */
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** 書き出した画像がこれより白ければ、画像化に失敗したとみなす */
+    static final double MIN_INK = 0.02;
+
+    /** 出力に目指す解像度（dpi）。これから画像化の倍率を決める */
+    static final int TARGET_DPI = 200;
+
+    /** 画像化の倍率の上限（大きいほど印刷がきれい、ファイルは重くなる） */
     static final int SCALE = 4;
     /** PDFの余白（pt） */
     static final float MARGIN = 40f;
     static final double[] ZOOM_STEPS = { 0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0,
             1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0 };
+    /** ブロックに変換する間だけ使う表示倍率。レンダラーの出力がページ倍率に影響されるため */
+    static final double RENDER_ZOOM = 1.0;
     static final double ZOOM_MIN = 0.25;
     static final double ZOOM_MAX = 4.0;
     static final Pattern ERROR_POS = Pattern.compile("\\((\\d+)\\s*,\\s*(\\d+)\\)|:(\\d+):(\\d+)|(?:line|行)\\s*(\\d+)");
@@ -105,16 +123,25 @@ public class MakeCodeBlankApp extends Application {
     private Parent ocrRoot;
     private Stage stage;
     private boolean exporting;
+    private String exportFormat = "PDF";
+    private int exportScale = SCALE;
     private double zoom = 1.0;
+    private double zoomBeforeRender = 0;
     private final BooleanProperty rendered = new SimpleBooleanProperty(false);
     private final Preferences prefs = Preferences.userNodeForPackage(MakeCodeBlankApp.class);
     private final HandwritingOcr ocr = new HandwritingOcr();
-    private BufferedImage ocrImage;
+    private final List<BufferedImage> ocrImages = new ArrayList<>();
+    private final List<Image> ocrViews = new ArrayList<>();
+    private int ocrIndex = -1;
     private ImageView ocrView;
+    private HBox ocrStrip;
     private StackPane ocrBusy;
     private Label ocrStatus;
     private Button ocrOpenBtn;
     private Button ocrRotateBtn;
+    private Button ocrRemoveBtn;
+    private Button ocrLeftBtn;
+    private Button ocrRightBtn;
     private Button ocrRunBtn;
 
     @Override
@@ -165,6 +192,7 @@ public class MakeCodeBlankApp extends Application {
     }
 
     private void applyRenderDefaults() {
+        restoreZoom();
         String layout = defaultLayout();
         if ("vertical".equals(layout)) js("arrangeVertical(true)");
         else if ("horizontal".equals(layout)) js("arrangeHorizontal(true)");
@@ -275,12 +303,25 @@ public class MakeCodeBlankApp extends Application {
         Button backBtn = new Button("← 戻る");
         backBtn.setOnAction(e -> showHome());
         ocrOpenBtn = new Button("画像を開く…");
-        ocrOpenBtn.setOnAction(e -> openOcrImage());
+        ocrOpenBtn.setOnAction(e -> openOcrImages());
         ocrRotateBtn = new Button("右に90°回転");
-        ocrRotateBtn.setDisable(true);
-        ocrRotateBtn.setOnAction(e -> setOcrImage(HandwritingOcr.rotateRight(ocrImage)));
+        ocrRotateBtn.setOnAction(e -> {
+            ocrImages.set(ocrIndex, HandwritingOcr.rotateRight(ocrImages.get(ocrIndex)));
+            ocrViews.set(ocrIndex, toFxImage(ocrImages.get(ocrIndex)));
+            refreshOcrSheets();
+        });
+        ocrRemoveBtn = new Button("この画像を外す");
+        ocrRemoveBtn.setOnAction(e -> {
+            ocrImages.remove(ocrIndex);
+            ocrViews.remove(ocrIndex);
+            ocrIndex = Math.min(ocrIndex, ocrImages.size() - 1);
+            refreshOcrSheets();
+        });
+        ocrLeftBtn = new Button("◀ 前へ");
+        ocrLeftBtn.setOnAction(e -> swapOcrSheet(-1));
+        ocrRightBtn = new Button("後へ ▶");
+        ocrRightBtn.setOnAction(e -> swapOcrSheet(1));
         ocrRunBtn = new Button("認識する");
-        ocrRunBtn.setDisable(true);
         ocrRunBtn.setStyle("-fx-font-weight: bold;");
         ocrRunBtn.setOnAction(e -> runOcr());
         Label server = new Label(HandwritingOcr.hasServer()
@@ -289,10 +330,11 @@ public class MakeCodeBlankApp extends Application {
         server.setStyle("-fx-text-fill: #666;");
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
-        ToolBar bar = new ToolBar(backBtn, new Separator(), ocrOpenBtn, ocrRotateBtn,
+        ToolBar bar = new ToolBar(backBtn, new Separator(), ocrOpenBtn, ocrRotateBtn, ocrRemoveBtn,
+                new Separator(), new Label("並び: "), ocrLeftBtn, ocrRightBtn,
                 new Separator(), ocrRunBtn, spacer, server);
 
-        Label hint = new Label("手書きの設計書の写真を開いてください");
+        Label hint = new Label("手書きの設計書の写真を開いてください（複数枚まとめて選べます）");
         hint.setStyle("-fx-font-size: 15px; -fx-text-fill: #666;");
         ocrView = new ImageView();
         ocrView.setPreserveRatio(true);
@@ -315,46 +357,117 @@ public class MakeCodeBlankApp extends Application {
         ocrView.fitWidthProperty().bind(center.widthProperty().subtract(24));
         ocrView.fitHeightProperty().bind(center.heightProperty().subtract(24));
 
+        ocrStrip = new HBox(8);
+        ocrStrip.setPadding(new Insets(8));
+        ocrStrip.setAlignment(Pos.CENTER_LEFT);
+        ScrollPane stripScroll = new ScrollPane(ocrStrip);
+        stripScroll.setFitToHeight(true);
+        stripScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        stripScroll.setMinHeight(104);
+        stripScroll.setPrefHeight(104);
+        stripScroll.setStyle("-fx-background: #eceff3; -fx-background-color: #eceff3;");
+
         ocrStatus = new Label(HandwritingOcr.hasServer() ? ""
                 : "認識サーバーの URL が設定されていません（HandwritingOcr.DEFAULT_SERVER_URL か環境変数 "
                         + HandwritingOcr.SERVER_URL_ENV + "）");
+        BorderPane.setMargin(ocrStatus, new Insets(4, 8, 4, 8));
+        VBox bottom = new VBox(stripScroll, ocrStatus);
+
         BorderPane root = new BorderPane(center);
         root.setTop(bar);
-        BorderPane.setMargin(ocrStatus, new Insets(4, 8, 4, 8));
-        root.setBottom(ocrStatus);
+        root.setBottom(bottom);
+        refreshOcrSheets();
         return root;
     }
 
-    private void openOcrImage() {
-        FileChooser fc = new FileChooser();
-        fc.setTitle("手書きの設計メモの画像");
-        fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("画像", "*.jpg", "*.jpeg", "*.png"));
-        File f = fc.showOpenDialog(stage);
-        if (f == null) return;
+    private void swapOcrSheet(int dir) {
+        int to = ocrIndex + dir;
+        if (to < 0 || to >= ocrImages.size()) return;
+        java.util.Collections.swap(ocrImages, ocrIndex, to);
+        java.util.Collections.swap(ocrViews, ocrIndex, to);
+        ocrIndex = to;
+        refreshOcrSheets();
+    }
+
+    private Image toFxImage(BufferedImage img) {
         try {
-            setOcrImage(HandwritingOcr.load(f));
-            ocrStatus.setText(f.getName() + " を開きました。向きが正しければ「認識する」を押してください");
-        } catch (HandwritingOcr.OcrException ex) {
-            ocrStatus.setText(ex.getMessage());
+            return new Image(new ByteArrayInputStream(HandwritingOcr.toJpeg(img, 2048)));
+        } catch (IOException ex) {
+            ocrStatus.setText("画像を表示できませんでした: " + ex.getMessage());
+            return null;
         }
     }
 
-    private void setOcrImage(BufferedImage img) {
-        ocrImage = img;
-        try {
-            ocrView.setImage(new Image(new ByteArrayInputStream(HandwritingOcr.toJpeg(img, 2048))));
-        } catch (IOException ex) {
-            ocrStatus.setText("画像を表示できませんでした: " + ex.getMessage());
+    private void refreshOcrSheets() {
+        boolean has = !ocrImages.isEmpty();
+        if (!has) ocrIndex = -1;
+        else if (ocrIndex < 0 || ocrIndex >= ocrImages.size()) ocrIndex = 0;
+
+        ocrView.setImage(has ? ocrViews.get(ocrIndex) : null);
+        ocrStrip.getChildren().clear();
+        for (int i = 0; i < ocrImages.size(); i++) {
+            ImageView thumb = new ImageView(ocrViews.get(i));
+            thumb.setPreserveRatio(true);
+            thumb.setFitHeight(64);
+            Label no = new Label((i + 1) + " 枚目");
+            no.setStyle("-fx-font-size: 11px;");
+            VBox cell = new VBox(2, thumb, no);
+            cell.setAlignment(Pos.CENTER);
+            cell.setPadding(new Insets(4));
+            cell.setStyle(i == ocrIndex
+                    ? "-fx-border-color: #2F6FD0; -fx-border-width: 2; -fx-background-color: white;"
+                    : "-fx-border-color: #c8ccd2; -fx-border-width: 1; -fx-background-color: white;");
+            final int index = i;
+            cell.setOnMouseClicked(e -> {
+                ocrIndex = index;
+                refreshOcrSheets();
+            });
+            ocrStrip.getChildren().add(cell);
         }
-        ocrRotateBtn.setDisable(false);
-        ocrRunBtn.setDisable(false);
+        updateOcrButtons(false);
+    }
+
+    private void updateOcrButtons(boolean busy) {
+        boolean has = !ocrImages.isEmpty();
+        ocrOpenBtn.setDisable(busy || ocrImages.size() >= HandwritingOcr.MAX_IMAGES);
+        ocrRotateBtn.setDisable(busy || !has);
+        ocrRemoveBtn.setDisable(busy || !has);
+        ocrLeftBtn.setDisable(busy || !has || ocrIndex <= 0);
+        ocrRightBtn.setDisable(busy || !has || ocrIndex >= ocrImages.size() - 1);
+        ocrRunBtn.setDisable(busy || !has);
+    }
+
+    private void openOcrImages() {
+        FileChooser fc = new FileChooser();
+        fc.setTitle("手書きの設計メモの画像（複数選択できます）");
+        fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("画像", "*.jpg", "*.jpeg", "*.png"));
+        List<File> files = fc.showOpenMultipleDialog(stage);
+        if (files == null || files.isEmpty()) return;
+        int added = 0;
+        for (File f : files) {
+            if (ocrImages.size() >= HandwritingOcr.MAX_IMAGES) {
+                ocrStatus.setText("画像は一度に " + HandwritingOcr.MAX_IMAGES + " 枚までです");
+                break;
+            }
+            try {
+                BufferedImage img = HandwritingOcr.load(f);
+                ocrImages.add(img);
+                ocrViews.add(toFxImage(img));
+                added++;
+            } catch (HandwritingOcr.OcrException ex) {
+                ocrStatus.setText(f.getName() + ": " + ex.getMessage());
+            }
+        }
+        if (added > 0) {
+            ocrIndex = ocrImages.size() - 1;
+            ocrStatus.setText(ocrImages.size() + " 枚を読み込みました。順番と向きを確かめて「認識する」を押してください");
+        }
+        refreshOcrSheets();
     }
 
     private void setOcrBusy(boolean busy) {
         ocrBusy.setVisible(busy);
-        ocrOpenBtn.setDisable(busy);
-        ocrRotateBtn.setDisable(busy || ocrImage == null);
-        ocrRunBtn.setDisable(busy || ocrImage == null);
+        updateOcrButtons(busy);
     }
 
     private boolean askInviteCode(String header) {
@@ -378,17 +491,17 @@ public class MakeCodeBlankApp extends Application {
     }
 
     private void runOcr() {
-        if (ocrImage == null) return;
+        if (ocrImages.isEmpty()) return;
         if (ocr.inviteCode().isEmpty()) {
             showHome();
             return;
         }
-        BufferedImage img = ocrImage;
+        List<BufferedImage> sheets = List.copyOf(ocrImages);
         setOcrBusy(true);
-        ocrStatus.setText("認識中です…");
+        ocrStatus.setText(sheets.size() > 1 ? sheets.size() + " 枚をまとめて認識中です…" : "認識中です…");
         Thread worker = new Thread(() -> {
             try {
-                HandwritingOcr.Result result = ocr.recognize(img);
+                HandwritingOcr.Result result = ocr.recognize(sheets);
                 Platform.runLater(() -> onOcrDone(result));
             } catch (HandwritingOcr.OcrException ex) {
                 Platform.runLater(() -> onOcrFailed(ex));
@@ -497,7 +610,10 @@ public class MakeCodeBlankApp extends Application {
         Button clearBtn = new Button("空欄を解除");
         clearBtn.setOnAction(e -> js("clearBlanks()"));
         Button pdfBtn = Icons.button(Icons.pdf(), "PDF出力（問題＋解答）");
-        pdfBtn.setOnAction(e -> exportPdf());
+        pdfBtn.setOnAction(e -> startExport("PDF"));
+
+        Button wordBtn = Icons.button(Icons.word(), "Word出力（問題＋解答）");
+        wordBtn.setOnAction(e -> startExport("Word"));
 
         Button svgBtn = new Button("SVG保存");
         svgBtn.setOnAction(e -> js("dumpSvg()"));
@@ -521,14 +637,14 @@ public class MakeCodeBlankApp extends Application {
         Button backBtn = new Button("← 戻る");
         backBtn.setOnAction(e -> showHome());
 
-        for (Button b : new Button[] { blankBtn, clearBtn, pdfBtn, svgBtn, vertBtn, horizBtn, resetPosBtn,
+        for (Button b : new Button[] { blankBtn, clearBtn, pdfBtn, wordBtn, svgBtn, vertBtn, horizBtn, resetPosBtn,
                 zoomOutBtn, zoomInBtn, fitBtn }) {
             b.disableProperty().bind(rendered.not());
         }
         zoomLabel.disableProperty().bind(rendered.not());
 
         ToolBar bar = new ToolBar(backBtn, new Separator(), renderBtn, previewBtn, new Separator(), blankBtn, clearBtn,
-                new Separator(), pdfBtn, svgBtn);
+                new Separator(), pdfBtn, wordBtn, svgBtn);
         ToolBar viewBar = new ToolBar(new Label("表示倍率: "), zoomOutBtn, zoomLabel, zoomInBtn, fitBtn,
                 new Separator(), new Label("配置: "), vertBtn, horizBtn, resetPosBtn);
 
@@ -601,9 +717,25 @@ public class MakeCodeBlankApp extends Application {
             editorJs("clearErrorMarkers()");
             JSObject win = (JSObject) engine.executeScript("window");
             win.setMember("pendingCode", codeText());
-            engine.executeScript("renderCode(pendingCode)");
+            zoomBeforeRender = zoom;
+            applyZoom(RENDER_ZOOM);
+            Platform.runLater(() -> {
+                try {
+                    engine.executeScript("renderCode(pendingCode)");
+                } catch (Exception ex) {
+                    restoreZoom();
+                    status.setText("エラー: " + ex.getMessage());
+                }
+            });
         } catch (Exception ex) {
             status.setText("エラー: " + ex.getMessage());
+        }
+    }
+
+    private void restoreZoom() {
+        if (zoomBeforeRender > 0) {
+            applyZoom(zoomBeforeRender);
+            zoomBeforeRender = 0;
         }
     }
 
@@ -740,11 +872,96 @@ public class MakeCodeBlankApp extends Application {
         }
     }
 
-    private void exportPdf() {
+    private void startExport(String format) {
         if (exporting) return;
         exporting = true;
-        status.setText("PDF用の画像を作成中…");
-        js("exportImages(" + SCALE + ")");
+        exportFormat = format;
+        exportScale = chooseScale();
+        status.setText(format + "用の画像を作成中…");
+        js("exportImages(" + exportScale + ")");
+    }
+
+    private int chooseScale() {
+        double cssWidth = 0;
+        try {
+            Object v = engine.executeScript(
+                    "(function(){var s=document.querySelector('#out svg');"
+                            + "if(!s) return 0;"
+                            + "return parseFloat(s.getAttribute('width'))||s.getBoundingClientRect().width;})()");
+            if (v instanceof Number n) cssWidth = n.doubleValue();
+        } catch (Exception ignored) {
+        }
+        if (cssWidth <= 0) return SCALE;
+        double placedPt = Math.min(cssWidth * 0.75, PdfExport.PAGE_W - 2 * MARGIN);
+        double wantedPx = TARGET_DPI * placedPt / 72.0;
+        int scale = (int) Math.round(wantedPx / cssWidth);
+        return Math.max(1, Math.min(SCALE, scale));
+    }
+
+    private List<Integer> blockBreaks() {
+        List<Integer> out = new ArrayList<>();
+        try {
+            Object v = engine.executeScript("blockTops(" + exportScale + ")");
+            if (v instanceof String s && !s.isBlank()) {
+                for (String part : s.split(",")) {
+                    out.add(Integer.parseInt(part.strip()));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    private List<int[]> guardBoxes() {
+        List<int[]> out = new ArrayList<>();
+        try {
+            Object v = engine.executeScript("guardBoxes(" + exportScale + ")");
+            if (v instanceof String s && !s.isBlank()) {
+                for (String part : s.split(";")) {
+                    String[] n = part.split(",");
+                    if (n.length == 4) {
+                        out.add(new int[] { Integer.parseInt(n[0].strip()), Integer.parseInt(n[1].strip()),
+                                Integer.parseInt(n[2].strip()), Integer.parseInt(n[3].strip()) });
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    private int textHeight() {
+        try {
+            Object v = engine.executeScript("textHeight(" + exportScale + ")");
+            if (v instanceof Number n) return n.intValue();
+        } catch (Exception ignored) {
+        }
+        return 0;
+    }
+
+    private List<int[]> stackSides() {
+        return pairs("stackSides(" + exportScale + ")");
+    }
+
+    private List<int[]> stackGroups() {
+        return pairs("stackBounds(" + exportScale + ")");
+    }
+
+    private List<int[]> pairs(String script) {
+        List<int[]> out = new ArrayList<>();
+        try {
+            Object v = engine.executeScript(script);
+            if (v instanceof String s && !s.isBlank()) {
+                for (String part : s.split(";")) {
+                    String[] xy = part.split(",");
+                    if (xy.length == 2) {
+                        out.add(new int[] { Integer.parseInt(xy[0].strip()), Integer.parseInt(xy[1].strip()) });
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return out;
     }
 
     private void onPdfImages(String questionB64, String answerB64) {
@@ -758,13 +975,28 @@ public class MakeCodeBlankApp extends Application {
             return;
         }
 
+        double questionInk = inkRatio(question);
+        double answerInk = inkRatio(answer);
+        if (questionInk < MIN_INK || answerInk < questionInk * 0.5) {
+            exporting = false;
+            status.setText("画像を作れませんでした。「ブロックに変換」をやり直すか、"
+                    + "プログラムを分けてからもう一度お試しください");
+            return;
+        }
+
+        PdfExport.Layout layout = new PdfExport.Layout(
+                stackGroups(), stackSides(), blockBreaks(), guardBoxes(), textHeight());
+        int scale = exportScale;
         String questionTitle = prefs.get(PREF_TITLE_Q, DEFAULT_TITLE_Q);
         String answerTitle = prefs.get(PREF_TITLE_A, DEFAULT_TITLE_A);
+        boolean word = "Word".equals(exportFormat);
         if (prefs.getBoolean(PREF_PDF_DIALOG, true)) {
-            String[] titles = PdfExport.editTitles(stage, question, answer, questionTitle, answerTitle, SCALE);
+            String[] titles = PdfExport.editTitles(stage,
+                    new PdfExport.Sheet(questionTitle, question, layout),
+                    new PdfExport.Sheet(answerTitle, answer, layout), exportFormat, scale);
             if (titles == null) {
                 exporting = false;
-                status.setText("PDF出力をキャンセルしました");
+                status.setText(exportFormat + "出力をキャンセルしました");
                 return;
             }
             questionTitle = titles[0];
@@ -772,41 +1004,96 @@ public class MakeCodeBlankApp extends Application {
         }
 
         FileChooser fc = new FileChooser();
-        fc.setTitle("PDFの保存先");
-        fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("PDF", "*.pdf"));
-        fc.setInitialFileName("worksheet.pdf");
+        fc.setTitle(exportFormat + "の保存先");
+        fc.getExtensionFilters().add(word
+                ? new FileChooser.ExtensionFilter("Word 文書", "*.docx")
+                : new FileChooser.ExtensionFilter("PDF", "*.pdf"));
+        fc.setInitialFileName(word ? "worksheet.docx" : "worksheet.pdf");
         File file = fc.showSaveDialog(stage);
         if (file == null) {
             exporting = false;
-            status.setText("PDF出力をキャンセルしました");
+            status.setText(exportFormat + "出力をキャンセルしました");
             return;
         }
 
         String qt = questionTitle, at = answerTitle;
-        status.setText("PDFを保存中…");
+        String format = exportFormat;
+        status.setText(format + "を保存中…");
         Thread worker = new Thread(() -> {
             String message;
             try {
-                PdfExport.write(file, PdfExport.compose(question, qt, SCALE),
-                        PdfExport.compose(answer, at, SCALE), SCALE);
-                message = "保存しました: " + file.getAbsolutePath() + "（1ページ目：問題 / 2ページ目：解答）";
+                List<PdfExport.Page> questionPages = PdfExport.pageParts(
+                        new PdfExport.Sheet(qt, question, layout), scale);
+                List<PdfExport.Page> answerPages = PdfExport.pageParts(
+                        new PdfExport.Sheet(at, answer, layout), scale);
+                List<PdfExport.Page> all = new ArrayList<>(questionPages);
+                all.addAll(answerPages);
+                if (word) {
+                    DocxExport.write(file, all, scale);
+                } else {
+                    List<BufferedImage> images = new ArrayList<>();
+                    for (PdfExport.Page p : all) images.add(PdfExport.compose(p.blocks(), p.title(), scale));
+                    PdfExport.writePdf(file, images, scale);
+                }
+                message = "保存しました: " + file.getAbsolutePath()
+                        + "（問題 " + questionPages.size() + " ページ / 解答 " + answerPages.size() + " ページ）";
             } catch (Exception ex) {
-                message = "PDFの保存に失敗しました: " + ex.getMessage();
+                message = format + "の保存に失敗しました: " + ex.getMessage();
             }
             String done = message;
             Platform.runLater(() -> {
                 exporting = false;
                 status.setText(done);
             });
-        }, "pdf");
+        }, "export");
         worker.setDaemon(true);
         worker.start();
     }
 
-    private static BufferedImage decodePng(String b64) throws IOException {
-        BufferedImage img = ImageIO.read(new ByteArrayInputStream(Base64.getDecoder().decode(b64)));
-        if (img == null) throw new IOException("画像を読み込めませんでした");
-        return img;
+    private static double inkRatio(BufferedImage img) {
+        int step = Math.max(1, Math.min(img.getWidth(), img.getHeight()) / 200);
+        long seen = 0, ink = 0;
+        for (int y = 0; y < img.getHeight(); y += step) {
+            for (int x = 0; x < img.getWidth(); x += step) {
+                int p = img.getRGB(x, y);
+                seen++;
+                if (((p >> 16) & 255) < 240 || ((p >> 8) & 255) < 240 || (p & 255) < 240) ink++;
+            }
+        }
+        return seen == 0 ? 0 : (double) ink / seen;
+    }
+
+    private static BufferedImage decodePng(String json) throws IOException {
+        JsonNode root = JSON.readTree(json);
+        int w = root.path("w").asInt();
+        int h = root.path("h").asInt();
+        if (w <= 0 || h <= 0) throw new IOException("画像を読み込めませんでした");
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = out.createGraphics();
+        g.setColor(Color.WHITE);
+        g.fillRect(0, 0, w, h);
+        List<int[]> spots = new ArrayList<>();
+        List<String> data = new ArrayList<>();
+        for (JsonNode tile : root.path("tiles")) {
+            spots.add(new int[] { tile.path("x").asInt(), tile.path("y").asInt() });
+            data.add(tile.path("data").asText());
+        }
+        List<BufferedImage> parts = data.parallelStream().map(b64 -> {
+            try {
+                return ImageIO.read(new ByteArrayInputStream(Base64.getDecoder().decode(b64)));
+            } catch (IOException ex) {
+                return null;
+            }
+        }).toList();
+        for (int i = 0; i < parts.size(); i++) {
+            if (parts.get(i) == null) {
+                g.dispose();
+                throw new IOException("画像を読み込めませんでした");
+            }
+            g.drawImage(parts.get(i), spots.get(i)[0], spots.get(i)[1], null);
+        }
+        g.dispose();
+        return out;
     }
 
     /** JavaScript から呼び出されるメソッド群（public 必須） */
@@ -849,11 +1136,24 @@ public class MakeCodeBlankApp extends Application {
 
         public void onRendered(boolean ok) {
             rendered.set(ok);
-            if (ok) Platform.runLater(MakeCodeBlankApp.this::applyRenderDefaults);
+            Platform.runLater(ok ? MakeCodeBlankApp.this::applyRenderDefaults
+                    : MakeCodeBlankApp.this::restoreZoom);
         }
 
         public void onExport(String q, String a) {
             Platform.runLater(() -> onPdfImages(q, a));
+        }
+
+        public void onCopy(String text) {
+            ClipboardContent content = new ClipboardContent();
+            content.putString(text == null ? "" : text);
+            Clipboard.getSystemClipboard().setContent(content);
+        }
+
+        public String clipboardText() {
+            Clipboard board = Clipboard.getSystemClipboard();
+            String s = board.hasString() ? board.getString() : null;
+            return s == null ? "" : s;
         }
 
         public void onSvg(String xml){

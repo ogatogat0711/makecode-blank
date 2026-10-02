@@ -128,6 +128,7 @@ function createEditor() {
       clearErrorMarkers();
       scheduleShapeReport();
     });
+    setupClipboard();
     ready = true;
     toJava("onEditorReady", "monaco " + MONACO_VERSION + " / " + navigator.userAgent);
     enableSyntaxCheck();
@@ -189,6 +190,68 @@ function registerCompletion() {
       return { suggestions: suggestions };
     },
   });
+}
+
+function setupClipboard() {
+  const ctrl = monaco.KeyMod.CtrlCmd;
+  editor.addCommand(ctrl | monaco.KeyCode.KeyC, () => clipboardCopy(false));
+  editor.addCommand(ctrl | monaco.KeyCode.KeyX, () => clipboardCopy(true));
+  editor.addCommand(ctrl | monaco.KeyCode.KeyV, clipboardPaste);
+  editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.Insert, clipboardPaste);
+  editor.addCommand(ctrl | monaco.KeyCode.Insert, () => clipboardCopy(false));
+  editor.addAction({
+    id: "makecode.copy",
+    label: "コピー",
+    contextMenuGroupId: "9_cutcopypaste",
+    contextMenuOrder: 1,
+    run: () => clipboardCopy(false),
+  });
+  editor.addAction({
+    id: "makecode.cut",
+    label: "切り取り",
+    contextMenuGroupId: "9_cutcopypaste",
+    contextMenuOrder: 2,
+    run: () => clipboardCopy(true),
+  });
+  editor.addAction({
+    id: "makecode.paste",
+    label: "貼り付け",
+    contextMenuGroupId: "9_cutcopypaste",
+    contextMenuOrder: 3,
+    run: clipboardPaste,
+  });
+}
+
+function clipboardCopy(cut) {
+  if (!editor) return;
+  const model = editor.getModel();
+  let range = editor.getSelection();
+  let text = model.getValueInRange(range);
+  if (!text) {
+    const ln = range.startLineNumber;
+    text = model.getLineContent(ln) + "\n";
+    range = new monaco.Range(ln, 1, ln + 1, 1);
+    if (ln >= model.getLineCount()) {
+      range = new monaco.Range(ln, 1, ln, model.getLineMaxColumn(ln));
+    }
+  }
+  toJava("onCopy", text);
+  if (cut) {
+    editor.pushUndoStop();
+    editor.executeEdits("clipboard", [{ range: range, text: "" }]);
+    editor.pushUndoStop();
+  }
+}
+
+function clipboardPaste() {
+  if (!editor || !window.bridge) return;
+  let text = "";
+  try { text = window.bridge.clipboardText(); } catch (e) { return; }
+  if (!text) return;
+  editor.pushUndoStop();
+  editor.executeEdits("clipboard",
+    [{ range: editor.getSelection(), text: String(text), forceMoveMarkers: true }]);
+  editor.pushUndoStop();
 }
 
 function getCode() {
